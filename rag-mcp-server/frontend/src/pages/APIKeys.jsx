@@ -57,8 +57,20 @@ export default function APIKeys() {
   }
 
   const copyToClipboard = (text) => {
-    navigator.clipboard.writeText(text)
-    setMessage({ type: 'info', text: 'Copied to clipboard' })
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(text)
+        .then(() => setMessage({ type: 'info', text: 'Copied to clipboard' }))
+        .catch(() => setMessage({ type: 'info', text: 'Select and copy the key manually' }))
+    } else {
+      // Fallback for HTTP contexts (non-HTTPS LAN)
+      const textarea = document.createElement('textarea')
+      textarea.value = text
+      document.body.appendChild(textarea)
+      textarea.select()
+      document.execCommand('copy')
+      document.body.removeChild(textarea)
+      setMessage({ type: 'info', text: 'Copied to clipboard' })
+    }
   }
 
   return (

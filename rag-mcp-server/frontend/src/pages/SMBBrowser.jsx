@@ -1,5 +1,5 @@
 import React, { useState } from 'react'
-import { browseSMB, ingestFromSMB, listCollections } from '../services/api'
+import { browseSMB, ingestFromSMB } from '../services/api'
 
 export default function SMBBrowser() {
   const [server, setServer] = useState('192.168.1.52')

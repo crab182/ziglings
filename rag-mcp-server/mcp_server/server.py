@@ -4,6 +4,7 @@ Provides RAG-powered document search tools to cloud-based LLMs.
 Authenticates via API key in the Authorization header.
 """
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -13,9 +14,8 @@ from pathlib import Path
 from typing import AsyncGenerator
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [MCP] %(levelname)s: %(message)s")
@@ -35,7 +35,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Store active SSE sessions
+# Store active SSE sessions: session_id -> {"active": bool, "queue": asyncio.Queue}
 sessions: dict[str, dict] = {}
 
 
@@ -247,7 +247,8 @@ async def sse_endpoint(request: Request, authorization: str | None = Header(None
     get_api_key(authorization)
 
     session_id = str(uuid.uuid4())
-    sessions[session_id] = {"active": True}
+    queue: asyncio.Queue = asyncio.Queue()
+    sessions[session_id] = {"active": True, "queue": queue}
     logger.info(f"New SSE session: {session_id}")
 
     async def event_generator() -> AsyncGenerator:
@@ -257,17 +258,16 @@ async def sse_endpoint(request: Request, authorization: str | None = Header(None
             "data": f"/messages?session_id={session_id}",
         }
 
-        # Keep connection alive
-        import asyncio
         try:
             while sessions.get(session_id, {}).get("active", False):
-                if "response" in sessions.get(session_id, {}):
-                    response = sessions[session_id].pop("response")
+                try:
+                    response = await asyncio.wait_for(queue.get(), timeout=1.0)
                     yield {
                         "event": "message",
                         "data": json.dumps(response),
                     }
-                await asyncio.sleep(0.1)
+                except asyncio.TimeoutError:
+                    continue
         except asyncio.CancelledError:
             pass
         finally:
@@ -317,9 +317,9 @@ async def handle_message(
 
     # Queue response for SSE delivery
     if session_id in sessions:
-        sessions[session_id]["response"] = response
+        await sessions[session_id]["queue"].put(response)
 
-    return {"status": "ok"}
+    return Response(status_code=202)
 
 
 # --- Streamable HTTP Transport (newer MCP spec) ---
@@ -338,7 +338,7 @@ async def mcp_streamable(
     result = handle_jsonrpc(body)
 
     if result is None:
-        return {"jsonrpc": "2.0", "result": {}}
+        return Response(status_code=204)
 
     if result.get("_async_tool_call"):
         params = result["params"]

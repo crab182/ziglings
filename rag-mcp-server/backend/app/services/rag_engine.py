@@ -1,6 +1,5 @@
 import hashlib
 import logging
-import os
 from pathlib import Path
 
 import chromadb
@@ -135,8 +134,15 @@ def list_documents(collection_name: str = "default") -> list[str]:
 
 def list_collections() -> list[dict]:
     client = get_chroma_client()
-    collections = client.list_collections()
-    return [{"name": c.name, "document_count": c.count()} for c in collections]
+    collection_names = client.list_collections()
+    result = []
+    for name in collection_names:
+        try:
+            col = client.get_collection(name)
+            result.append({"name": name, "document_count": col.count()})
+        except Exception:
+            result.append({"name": name, "document_count": 0})
+    return result
 
 
 def delete_collection(name: str):

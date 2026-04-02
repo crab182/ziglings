@@ -1,23 +1,7 @@
 import logging
 from datetime import datetime, timezone
-from io import BytesIO
 
-from smbprotocol.connection import Connection
-from smbprotocol.session import Session
-from smbprotocol.tree import TreeConnect
-from smbprotocol.open import (
-    Open,
-    CreateDisposition,
-    CreateOptions,
-    FileAttributes,
-    FilePipePrinterAccessMask,
-    ImpersonationLevel,
-    ShareAccess,
-)
-from smbprotocol.file_info import (
-    FileInformationClass,
-)
-import smbprotocol
+import smbclient
 
 logger = logging.getLogger(__name__)
 
@@ -36,8 +20,6 @@ def browse_share(
     domain: str = "WORKGROUP",
 ) -> list[dict]:
     """Browse files and directories in an SMB share."""
-    import smbclient
-
     smbclient.register_session(server, username=username, password=password, port=445)
 
     smb_path = f"\\\\{server}\\{share}"
@@ -74,8 +56,6 @@ def read_file(
     domain: str = "WORKGROUP",
 ) -> bytes:
     """Read a file from an SMB share."""
-    import smbclient
-
     smbclient.register_session(server, username=username, password=password, port=445)
 
     normalized = _normalize_path(path)
@@ -91,16 +71,27 @@ def list_shares(
     password: str = "",
     domain: str = "WORKGROUP",
 ) -> list[str]:
-    """List available shares on an SMB server."""
-    import smbclient
+    """List available shares on an SMB server using ClientConfig."""
+    from smbprotocol.connection import Connection
+    from smbprotocol.session import Session
+    from smbprotocol.tree import TreeConnect
+    import struct
+    import uuid as _uuid
 
     smbclient.register_session(server, username=username, password=password, port=445)
 
+    # Use smbclient to list shares by connecting to IPC$ and listing
+    # Fallback: try scanning the server root (works on some implementations)
     shares = []
     try:
         for entry in smbclient.scandir(f"\\\\{server}"):
             shares.append(entry.name)
-    except Exception as e:
-        logger.error(f"Failed to list shares on {server}: {e}")
-        raise
+    except Exception:
+        # If scandir on server root fails, return a helpful error
+        logger.warning(f"Could not enumerate shares on {server} via scandir, "
+                       "try specifying the share name directly")
+        raise ValueError(
+            f"Could not auto-discover shares on {server}. "
+            "Please enter the share name manually (e.g., 'Documents', 'Public')."
+        )
     return sorted(shares)

@@ -54,7 +54,7 @@ def _parse_text(content: bytes) -> str:
 
 
 def _parse_pdf(content: bytes) -> str:
-    from PyPDF2 import PdfReader
+    from pypdf import PdfReader
     reader = PdfReader(BytesIO(content))
     text_parts = []
     for page in reader.pages:
