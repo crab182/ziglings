@@ -54,8 +54,9 @@ export const browseSMB = (server, share, path = '/', username = 'guest', passwor
   });
 
 export const listShares = (server, username = 'guest', password = '', domain = 'WORKGROUP') =>
-  request(`/smb/shares?server=${server}&username=${username}&password=${password}&domain=${domain}`, {
+  request('/smb/shares', {
     method: 'POST',
+    body: JSON.stringify({ server, username, password, domain }),
   });
 
 export const ingestFromSMB = (config) =>

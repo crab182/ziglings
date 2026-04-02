@@ -1,8 +1,10 @@
 node_modules/
 dist/
 .env
-data/chromadb/
-data/config/
+data/chromadb/*
+!data/chromadb/.gitkeep
+data/config/*
+!data/config/.gitkeep
 __pycache__/
 *.pyc
 .venv/

@@ -2,6 +2,3 @@ node_modules/
 dist/
 .git
 .env
-data/
-__pycache__/
-*.pyc

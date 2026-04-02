@@ -1,5 +1,3 @@
-from typing import Optional
-
 from pydantic import BaseModel
 
 
@@ -38,6 +36,13 @@ class SMBShareConfig(BaseModel):
     password: str = ""
     domain: str = "WORKGROUP"
     path: str = "/"
+
+
+class SMBListSharesRequest(BaseModel):
+    server: str
+    username: str = "guest"
+    password: str = ""
+    domain: str = "WORKGROUP"
 
 
 class SMBBrowseRequest(BaseModel):

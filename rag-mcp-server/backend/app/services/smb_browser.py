@@ -71,25 +71,18 @@ def list_shares(
     password: str = "",
     domain: str = "WORKGROUP",
 ) -> list[str]:
-    """List available shares on an SMB server using ClientConfig."""
-    from smbprotocol.connection import Connection
-    from smbprotocol.session import Session
-    from smbprotocol.tree import TreeConnect
-    import struct
-    import uuid as _uuid
-
+    """List available shares on an SMB server."""
     smbclient.register_session(server, username=username, password=password, port=445)
 
-    # Use smbclient to list shares by connecting to IPC$ and listing
-    # Fallback: try scanning the server root (works on some implementations)
     shares = []
     try:
         for entry in smbclient.scandir(f"\\\\{server}"):
             shares.append(entry.name)
     except Exception:
-        # If scandir on server root fails, return a helpful error
-        logger.warning(f"Could not enumerate shares on {server} via scandir, "
-                       "try specifying the share name directly")
+        logger.warning(
+            f"Could not enumerate shares on {server} via scandir, "
+            "try specifying the share name directly"
+        )
         raise ValueError(
             f"Could not auto-discover shares on {server}. "
             "Please enter the share name manually (e.g., 'Documents', 'Public')."
