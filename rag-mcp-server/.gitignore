@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.env
+data/chromadb/
+data/config/
+__pycache__/
+*.pyc
+.venv/
