@@ -1,0 +1,58 @@
+version: "3.8"
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: rag-mcp-backend
+    restart: unless-stopped
+    ports:
+      - "8900:8000"
+    volumes:
+      - ./data/documents:/app/data/documents
+      - ./data/chromadb:/app/data/chromadb
+      - ./data/config:/app/data/config
+    environment:
+      - CHROMA_PERSIST_DIR=/app/data/chromadb
+      - DOCUMENTS_DIR=/app/data/documents
+      - CONFIG_DIR=/app/data/config
+      - EMBEDDING_MODEL=all-MiniLM-L6-v2
+    networks:
+      - rag-network
+
+  mcp-server:
+    build:
+      context: ./mcp_server
+      dockerfile: Dockerfile
+    container_name: rag-mcp-server
+    restart: unless-stopped
+    ports:
+      - "8901:8001"
+    volumes:
+      - ./data/config:/app/data/config
+    environment:
+      - BACKEND_URL=http://backend:8000
+      - CONFIG_DIR=/app/data/config
+    depends_on:
+      - backend
+    networks:
+      - rag-network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: rag-mcp-frontend
+    restart: unless-stopped
+    ports:
+      - "8902:80"
+    depends_on:
+      - backend
+      - mcp-server
+    networks:
+      - rag-network
+
+networks:
+  rag-network:
+    driver: bridge
