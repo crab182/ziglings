@@ -2,7 +2,7 @@ fastapi==0.115.6
 uvicorn[standard]==0.34.0
 chromadb==0.5.23
 sentence-transformers==3.3.1
-python-multipart==0.0.18
+python-multipart==0.0.22
 pydantic==2.10.4
 pydantic-settings==2.7.1
 smbprotocol==1.14.0
