@@ -407,3 +407,76 @@ body {
 
 .tab:hover { color: var(--text-primary); }
 .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+.auth-screen {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  padding: 1rem;
+}
+
+.auth-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 2rem;
+  width: 100%;
+  max-width: 440px;
+}
+
+.auth-card h2 { margin-bottom: 0.5rem; }
+.auth-card p { color: var(--text-muted); margin-bottom: 1.25rem; }
+
+.auth-card form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.auth-card label {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+}
+
+.auth-card input {
+  background: var(--bg-input);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.65rem 0.8rem;
+  font-size: 0.95rem;
+}
+
+.auth-card button {
+  margin-top: 0.75rem;
+  background: var(--accent);
+  color: white;
+  border: none;
+  border-radius: var(--radius);
+  padding: 0.7rem;
+  font-size: 0.95rem;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.auth-card button:hover { background: var(--accent-hover); }
+.auth-card button:disabled { opacity: 0.6; cursor: not-allowed; }
+
+.auth-error {
+  color: var(--danger);
+  font-size: 0.85rem;
+  margin-top: 0.25rem;
+}
+
+.key-display {
+  background: var(--bg-input);
+  color: var(--text-primary);
+  padding: 0.75rem;
+  border-radius: var(--radius);
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-size: 0.85rem;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  margin: 0.75rem 0;
+}

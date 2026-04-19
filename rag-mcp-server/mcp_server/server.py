@@ -6,6 +6,7 @@ Authenticates via API key in the Authorization header.
 
 import asyncio
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -17,6 +18,7 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [MCP] %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -25,15 +27,31 @@ BACKEND_URL = os.environ.get("BACKEND_URL", "http://backend:8000")
 CONFIG_DIR = os.environ.get("CONFIG_DIR", "/app/data/config")
 CONFIG_FILE = Path(CONFIG_DIR) / "server_config.json"
 
+CORS_ORIGINS = [o.strip() for o in os.environ.get("CORS_ALLOWED_ORIGINS", "http://192.168.1.52:8902,http://localhost:8902").split(",") if o.strip()]
+ALLOWED_HOSTS = {h.strip() for h in os.environ.get("ALLOWED_HOSTS", "192.168.1.52:8901,192.168.1.52:8902,localhost:8901,localhost:8902,mcp-server:8001").split(",") if h.strip()}
+
 app = FastAPI(title="RAG MCP Server", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Accept"],
+    max_age=600,
 )
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        return response
+
+
+app.add_middleware(SecurityHeadersMiddleware)
 
 # Store active SSE sessions: session_id -> {"active": bool, "queue": asyncio.Queue}
 sessions: dict[str, dict] = {}
@@ -46,35 +64,45 @@ def load_config() -> dict:
 
 
 def validate_api_key(key: str) -> bool:
+    if not key:
+        return False
     config = load_config()
     if not config.get("mcp_enabled", True):
         return False
     hashed = hashlib.sha256(key.encode()).hexdigest()
+    valid = False
     for entry in config.get("api_keys", []):
-        if entry["key_hash"] == hashed and entry.get("active", True):
-            return True
-    return False
+        if not entry.get("active", True):
+            continue
+        if hmac.compare_digest(entry["key_hash"], hashed):
+            valid = True
+    return valid
 
 
 def get_api_key(authorization: str | None) -> str:
     if not authorization:
         raise HTTPException(401, "Missing Authorization header")
-    if authorization.startswith("Bearer "):
-        key = authorization[7:]
-    else:
-        key = authorization
+    key = authorization[7:].strip() if authorization.startswith("Bearer ") else authorization.strip()
     if not validate_api_key(key):
         raise HTTPException(403, "Invalid or inactive API key")
     return key
 
 
+def check_origin(request: Request) -> None:
+    """Reject requests with browser Origin header not in allowlist (DNS rebinding / CSRF defense)."""
+    origin = request.headers.get("origin")
+    if origin is None:
+        # Non-browser clients (LLMs, curl) typically omit Origin; allow these.
+        return
+    for allowed in CORS_ORIGINS:
+        if origin == allowed:
+            return
+    raise HTTPException(403, "Origin not allowed")
+
+
 # --- MCP Protocol Implementation ---
 
-SERVER_INFO = {
-    "name": "rag-document-server",
-    "version": "1.0.0",
-}
-
+SERVER_INFO = {"name": "rag-document-server", "version": "1.0.0"}
 SERVER_CAPABILITIES = {
     "tools": {"listChanged": False},
     "resources": {"subscribe": False, "listChanged": False},
@@ -87,20 +115,9 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "The search query to find relevant documents",
-                },
-                "collection": {
-                    "type": "string",
-                    "description": "Document collection to search in (default: 'default')",
-                    "default": "default",
-                },
-                "n_results": {
-                    "type": "integer",
-                    "description": "Number of results to return (default: 5)",
-                    "default": 5,
-                },
+                "query": {"type": "string", "description": "The search query to find relevant documents"},
+                "collection": {"type": "string", "description": "Document collection to search in (default: 'default')", "default": "default"},
+                "n_results": {"type": "integer", "description": "Number of results to return (default: 5)", "default": 5},
             },
             "required": ["query"],
         },
@@ -108,10 +125,7 @@ TOOLS = [
     {
         "name": "list_collections",
         "description": "List all available document collections with their document counts.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {},
-        },
+        "inputSchema": {"type": "object", "properties": {}},
     },
     {
         "name": "list_documents",
@@ -119,40 +133,33 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "collection": {
-                    "type": "string",
-                    "description": "Collection name (default: 'default')",
-                    "default": "default",
-                },
+                "collection": {"type": "string", "description": "Collection name (default: 'default')", "default": "default"},
             },
         },
     },
     {
         "name": "get_server_status",
         "description": "Get the current status of the RAG server including document counts and available collections.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {},
-        },
+        "inputSchema": {"type": "object", "properties": {}},
     },
 ]
 
 
-async def handle_tool_call(name: str, arguments: dict) -> dict:
-    async with httpx.AsyncClient(base_url=BACKEND_URL, timeout=60.0) as client:
+async def handle_tool_call(name: str, arguments: dict, client_key: str) -> dict:
+    headers = {"Authorization": f"Bearer {client_key}"}
+    async with httpx.AsyncClient(base_url=BACKEND_URL, timeout=60.0, headers=headers) as client:
         if name == "search_documents":
             resp = await client.post("/api/documents/query", json={
-                "query": arguments["query"],
+                "query": arguments.get("query", ""),
                 "collection": arguments.get("collection", "default"),
-                "n_results": arguments.get("n_results", 5),
+                "n_results": min(max(int(arguments.get("n_results", 5)), 1), 50),
             })
             resp.raise_for_status()
             data = resp.json()
-            results_text = []
-            for r in data["results"]:
-                results_text.append(
-                    f"**Source:** {r['source']} (score: {r['score']})\n{r['content']}"
-                )
+            results_text = [
+                f"**Source:** {r['source']} (score: {r['score']})\n{r['content']}"
+                for r in data["results"]
+            ]
             return {
                 "content": [{"type": "text", "text": "\n\n---\n\n".join(results_text) or "No results found."}],
                 "isError": False,
@@ -170,7 +177,7 @@ async def handle_tool_call(name: str, arguments: dict) -> dict:
 
         elif name == "list_documents":
             collection = arguments.get("collection", "default")
-            resp = await client.get(f"/api/documents/list?collection={collection}")
+            resp = await client.get("/api/documents/list", params={"collection": collection})
             resp.raise_for_status()
             data = resp.json()
             docs = data.get("documents", [])
@@ -190,15 +197,10 @@ async def handle_tool_call(name: str, arguments: dict) -> dict:
             )
             return {"content": [{"type": "text", "text": text}], "isError": False}
 
-        else:
-            return {
-                "content": [{"type": "text", "text": f"Unknown tool: {name}"}],
-                "isError": True,
-            }
+        return {"content": [{"type": "text", "text": f"Unknown tool: {name}"}], "isError": True}
 
 
-def handle_jsonrpc(request_body: dict) -> dict:
-    """Process a JSON-RPC request and return the response skeleton."""
+def handle_jsonrpc(request_body: dict) -> dict | None:
     method = request_body.get("method", "")
     req_id = request_body.get("id")
     params = request_body.get("params", {})
@@ -214,36 +216,27 @@ def handle_jsonrpc(request_body: dict) -> dict:
             },
         }
     elif method == "notifications/initialized":
-        return None  # No response for notifications
+        return None
     elif method == "tools/list":
-        return {
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "result": {"tools": TOOLS},
-        }
+        return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": TOOLS}}
     elif method == "tools/call":
-        # Handled async separately
         return {"_async_tool_call": True, "id": req_id, "params": params}
     elif method == "resources/list":
-        return {
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "result": {"resources": []},
-        }
+        return {"jsonrpc": "2.0", "id": req_id, "result": {"resources": []}}
     elif method == "ping":
         return {"jsonrpc": "2.0", "id": req_id, "result": {}}
-    else:
-        return {
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "error": {"code": -32601, "message": f"Method not found: {method}"},
-        }
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {"code": -32601, "message": f"Method not found: {method}"},
+    }
 
 
 # --- HTTP + SSE Transport ---
 
 @app.get("/sse")
 async def sse_endpoint(request: Request, authorization: str | None = Header(None)):
+    check_origin(request)
     get_api_key(authorization)
 
     session_id = str(uuid.uuid4())
@@ -252,20 +245,12 @@ async def sse_endpoint(request: Request, authorization: str | None = Header(None
     logger.info(f"New SSE session: {session_id}")
 
     async def event_generator() -> AsyncGenerator:
-        # Send the endpoint URL for the client to POST messages to
-        yield {
-            "event": "endpoint",
-            "data": f"/messages?session_id={session_id}",
-        }
-
+        yield {"event": "endpoint", "data": f"/messages?session_id={session_id}"}
         try:
             while sessions.get(session_id, {}).get("active", False):
                 try:
                     response = await asyncio.wait_for(queue.get(), timeout=1.0)
-                    yield {
-                        "event": "message",
-                        "data": json.dumps(response),
-                    }
+                    yield {"event": "message", "data": json.dumps(response)}
                 except asyncio.TimeoutError:
                     continue
         except asyncio.CancelledError:
@@ -283,7 +268,8 @@ async def handle_message(
     session_id: str,
     authorization: str | None = Header(None),
 ):
-    get_api_key(authorization)
+    check_origin(request)
+    client_key = get_api_key(authorization)
 
     if session_id not in sessions:
         raise HTTPException(404, "Session not found")
@@ -292,7 +278,6 @@ async def handle_message(
     logger.info(f"Received message: {body.get('method', 'unknown')}")
 
     result = handle_jsonrpc(body)
-
     if result is None:
         return {"status": "ok"}
 
@@ -301,21 +286,14 @@ async def handle_message(
         tool_name = params.get("name", "")
         tool_args = params.get("arguments", {})
         try:
-            tool_result = await handle_tool_call(tool_name, tool_args)
-        except Exception as e:
-            tool_result = {
-                "content": [{"type": "text", "text": f"Error: {str(e)}"}],
-                "isError": True,
-            }
-        response = {
-            "jsonrpc": "2.0",
-            "id": result["id"],
-            "result": tool_result,
-        }
+            tool_result = await handle_tool_call(tool_name, tool_args, client_key)
+        except Exception:
+            logger.exception("Tool call failed: %s", tool_name)
+            tool_result = {"content": [{"type": "text", "text": "Tool execution failed"}], "isError": True}
+        response = {"jsonrpc": "2.0", "id": result["id"], "result": tool_result}
     else:
         response = result
 
-    # Queue response for SSE delivery
     if session_id in sessions:
         await sessions[session_id]["queue"].put(response)
 
@@ -325,18 +303,14 @@ async def handle_message(
 # --- Streamable HTTP Transport (newer MCP spec) ---
 
 @app.post("/mcp")
-async def mcp_streamable(
-    request: Request,
-    authorization: str | None = Header(None),
-):
-    """Streamable HTTP endpoint - handles single request/response MCP calls."""
-    get_api_key(authorization)
+async def mcp_streamable(request: Request, authorization: str | None = Header(None)):
+    check_origin(request)
+    client_key = get_api_key(authorization)
 
     body = await request.json()
     logger.info(f"MCP streamable request: {body.get('method', 'unknown')}")
 
     result = handle_jsonrpc(body)
-
     if result is None:
         return Response(status_code=204)
 
@@ -345,17 +319,11 @@ async def mcp_streamable(
         tool_name = params.get("name", "")
         tool_args = params.get("arguments", {})
         try:
-            tool_result = await handle_tool_call(tool_name, tool_args)
-        except Exception as e:
-            tool_result = {
-                "content": [{"type": "text", "text": f"Error: {str(e)}"}],
-                "isError": True,
-            }
-        return {
-            "jsonrpc": "2.0",
-            "id": result["id"],
-            "result": tool_result,
-        }
+            tool_result = await handle_tool_call(tool_name, tool_args, client_key)
+        except Exception:
+            logger.exception("Tool call failed: %s", tool_name)
+            tool_result = {"content": [{"type": "text", "text": "Tool execution failed"}], "isError": True}
+        return {"jsonrpc": "2.0", "id": result["id"], "result": tool_result}
 
     return result
 
