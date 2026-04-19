@@ -1,11 +1,32 @@
 const API_BASE = '/api';
+const TOKEN_KEY = 'rmcp_api_key';
+
+export const getToken = () => localStorage.getItem(TOKEN_KEY) || '';
+export const setToken = (token) => {
+  if (token) localStorage.setItem(TOKEN_KEY, token);
+  else localStorage.removeItem(TOKEN_KEY);
+};
+export const clearToken = () => localStorage.removeItem(TOKEN_KEY);
+
+function authHeaders() {
+  const token = getToken();
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
 
 async function request(path, options = {}) {
   const { headers, ...rest } = options;
   const res = await fetch(`${API_BASE}${path}`, {
     ...rest,
-    headers: { 'Content-Type': 'application/json', ...headers },
+    headers: {
+      'Content-Type': 'application/json',
+      ...authHeaders(),
+      ...headers,
+    },
   });
+  if (res.status === 401 || res.status === 403) {
+    const error = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(error.detail || `Unauthorized: ${res.status}`);
+  }
   if (!res.ok) {
     const error = await res.json().catch(() => ({ detail: res.statusText }));
     throw new Error(error.detail || `Request failed: ${res.status}`);
@@ -13,13 +34,20 @@ async function request(path, options = {}) {
   return res.json();
 }
 
+// Bootstrap
+export const checkBootstrap = () => request('/admin/bootstrap-required');
+
 // Documents
 export const uploadDocument = async (file, collection = 'default') => {
   const formData = new FormData();
   formData.append('file', file);
   formData.append('collection', collection);
-  const res = await fetch(`${API_BASE}/documents/upload`, { method: 'POST', body: formData });
-  if (!res.ok) throw new Error((await res.json()).detail || 'Upload failed');
+  const res = await fetch(`${API_BASE}/documents/upload`, {
+    method: 'POST',
+    headers: authHeaders(),
+    body: formData,
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Upload failed');
   return res.json();
 };
 
@@ -30,13 +58,13 @@ export const queryDocuments = (query, collection = 'default', n_results = 5) =>
   });
 
 export const listDocuments = (collection = 'default') =>
-  request(`/documents/list?collection=${collection}`);
+  request(`/documents/list?collection=${encodeURIComponent(collection)}`);
 
 export const deleteDocument = (filename, collection = 'default') =>
-  request(`/documents/${encodeURIComponent(filename)}?collection=${collection}`, { method: 'DELETE' });
+  request(`/documents/${encodeURIComponent(filename)}?collection=${encodeURIComponent(collection)}`, { method: 'DELETE' });
 
 export const reindexCollection = (collection = 'default') =>
-  request(`/documents/reindex?collection=${collection}`, { method: 'POST' });
+  request(`/documents/reindex?collection=${encodeURIComponent(collection)}`, { method: 'POST' });
 
 export const listCollections = () => request('/documents/collections');
 
@@ -64,8 +92,11 @@ export const ingestFromSMB = (config) =>
 
 // Admin
 export const getStatus = () => request('/admin/status');
-export const createAPIKey = (name, description = '') =>
-  request('/admin/api-keys', { method: 'POST', body: JSON.stringify({ name, description }) });
+export const createAPIKey = (name, description = '', is_admin = false) =>
+  request('/admin/api-keys', {
+    method: 'POST',
+    body: JSON.stringify({ name, description, is_admin }),
+  });
 export const listAPIKeys = () => request('/admin/api-keys');
 export const deleteAPIKey = (name) =>
   request(`/admin/api-keys/${encodeURIComponent(name)}`, { method: 'DELETE' });

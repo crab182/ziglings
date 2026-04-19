@@ -5,6 +5,7 @@ export default function APIKeys() {
   const [keys, setKeys] = useState([])
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
+  const [isAdmin, setIsAdmin] = useState(false)
   const [newKey, setNewKey] = useState(null)
   const [loading, setLoading] = useState(false)
   const [message, setMessage] = useState(null)
@@ -22,10 +23,11 @@ export default function APIKeys() {
     }
     setLoading(true)
     try {
-      const result = await createAPIKey(name.trim(), description.trim())
+      const result = await createAPIKey(name.trim(), description.trim(), isAdmin)
       setNewKey(result.key)
       setName('')
       setDescription('')
+      setIsAdmin(false)
       setMessage({ type: 'success', text: 'API key created. Copy it now - it cannot be retrieved later.' })
       refresh()
     } catch (e) {
@@ -113,6 +115,12 @@ export default function APIKeys() {
             <input className="input" value={description} onChange={e => setDescription(e.target.value)} placeholder="What this key is used for" />
           </div>
         </div>
+        <div className="form-group">
+          <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+            <input type="checkbox" checked={isAdmin} onChange={e => setIsAdmin(e.target.checked)} />
+            Admin key (can manage keys, collections, SMB; otherwise read-only)
+          </label>
+        </div>
         <button className="btn btn-primary" onClick={handleCreate} disabled={loading}>
           {loading ? <><span className="spinner"></span> Creating...</> : 'Create API Key'}
         </button>
@@ -129,6 +137,7 @@ export default function APIKeys() {
               <tr>
                 <th>Name</th>
                 <th>Key Prefix</th>
+                <th>Role</th>
                 <th>Description</th>
                 <th>Created</th>
                 <th>Status</th>
@@ -140,6 +149,11 @@ export default function APIKeys() {
                 <tr key={k.name}>
                   <td><strong>{k.name}</strong></td>
                   <td><code>{k.key_prefix}</code></td>
+                  <td>
+                    <span className={`badge ${k.is_admin ? 'badge-danger' : 'badge-success'}`}>
+                      {k.is_admin ? 'admin' : 'read-only'}
+                    </span>
+                  </td>
                   <td style={{ color: 'var(--text-muted)' }}>{k.description || '-'}</td>
                   <td style={{ color: 'var(--text-muted)' }}>{new Date(k.created_at).toLocaleDateString()}</td>
                   <td>
