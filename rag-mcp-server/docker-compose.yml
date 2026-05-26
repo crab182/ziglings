@@ -11,6 +11,7 @@ services:
       - ./data/documents:/app/data/documents
       - ./data/chromadb:/app/data/chromadb
       - ./data/config:/app/data/config
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     environment:
       - CHROMA_PERSIST_DIR=/app/data/chromadb
       - DOCUMENTS_DIR=/app/data/documents

@@ -142,6 +142,48 @@ TOOLS = [
         "description": "Get the current status of the RAG server including document counts and available collections.",
         "inputSchema": {"type": "object", "properties": {}},
     },
+    {
+        "name": "list_agents",
+        "description": "List all deployed AI agents on the server with their current status, type, and last heartbeat time.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_agent_status",
+        "description": "Get detailed status of a specific agent including recent tasks and health information.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "agent_id": {"type": "string", "description": "The agent identifier (e.g., 'doc-summarizer', 'task-runner')"},
+            },
+            "required": ["agent_id"],
+        },
+    },
+    {
+        "name": "submit_agent_task",
+        "description": "Submit a task to a specific agent for execution. The task-runner agent accepts arbitrary tasks processed by Claude.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "agent_id": {"type": "string", "description": "Target agent identifier"},
+                "description": {"type": "string", "description": "Human-readable task description"},
+                "task_type": {"type": "string", "description": "Task type: 'shell', 'api_call', or 'query'", "default": "query"},
+                "payload": {"type": "object", "description": "Task-specific parameters", "default": {}},
+            },
+            "required": ["agent_id", "description"],
+        },
+    },
+    {
+        "name": "get_agent_tasks",
+        "description": "Get recent tasks for a specific agent with their status and results.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "agent_id": {"type": "string", "description": "The agent identifier"},
+                "limit": {"type": "integer", "description": "Number of recent tasks to return (default: 10)", "default": 10},
+            },
+            "required": ["agent_id"],
+        },
+    },
 ]
 
 
@@ -195,6 +237,74 @@ async def handle_tool_call(name: str, arguments: dict, client_key: str) -> dict:
                 f"**Collections:** {', '.join(data['collections']) or 'none'}\n"
                 f"**Active API Keys:** {data['api_keys_count']}"
             )
+            return {"content": [{"type": "text", "text": text}], "isError": False}
+
+        elif name == "list_agents":
+            resp = await client.get("/api/agents/list")
+            resp.raise_for_status()
+            agents = resp.json().get("agents", [])
+            if not agents:
+                text = "No agents currently registered."
+            else:
+                lines = []
+                for a in agents:
+                    status_icon = "running" if a["status"] == "running" else a["status"]
+                    lines.append(
+                        f"- **{a['agent_id']}** ({a['agent_type']}) - {status_icon} | "
+                        f"tasks: {a.get('tasks_completed', 0)} | heartbeat: {a.get('last_heartbeat', 'never')}"
+                    )
+                text = "\n".join(lines)
+            return {"content": [{"type": "text", "text": text}], "isError": False}
+
+        elif name == "get_agent_status":
+            agent_id = arguments.get("agent_id", "")
+            resp = await client.get(f"/api/agents/{agent_id}/status")
+            resp.raise_for_status()
+            a = resp.json()
+            text = (
+                f"**Agent:** {a['agent_id']}\n"
+                f"**Type:** {a['agent_type']}\n"
+                f"**Status:** {a.get('status', 'unknown')}\n"
+                f"**Container:** {a.get('container_name', '')}\n"
+                f"**Registered:** {a.get('registered_at', '')}\n"
+                f"**Last Heartbeat:** {a.get('last_heartbeat', '')}\n"
+                f"**Tasks Completed:** {a.get('tasks_completed', 0)}\n"
+            )
+            recent = a.get("recent_tasks", [])
+            if recent:
+                text += "\n**Recent Tasks:**\n"
+                for t in recent:
+                    text += f"- [{t['status']}] {t['description'][:80]} (id: {t['task_id']})\n"
+            return {"content": [{"type": "text", "text": text}], "isError": False}
+
+        elif name == "submit_agent_task":
+            agent_id = arguments.get("agent_id", "")
+            resp = await client.post(f"/api/agents/{agent_id}/tasks", json={
+                "description": arguments.get("description", ""),
+                "task_type": arguments.get("task_type", "query"),
+                "payload": arguments.get("payload", {}),
+            })
+            resp.raise_for_status()
+            task = resp.json()
+            text = f"Task submitted to **{agent_id}**\n- Task ID: `{task['task_id']}`\n- Status: {task['status']}"
+            return {"content": [{"type": "text", "text": text}], "isError": False}
+
+        elif name == "get_agent_tasks":
+            agent_id = arguments.get("agent_id", "")
+            limit = min(max(int(arguments.get("limit", 10)), 1), 100)
+            resp = await client.get(f"/api/agents/{agent_id}/tasks", params={"limit": limit})
+            resp.raise_for_status()
+            tasks = resp.json().get("tasks", [])
+            if not tasks:
+                text = f"No tasks found for agent **{agent_id}**."
+            else:
+                lines = [f"**Tasks for {agent_id}:**"]
+                for t in tasks:
+                    result_preview = ""
+                    if t.get("result"):
+                        result_preview = f" | result: {t['result'][:100]}..."
+                    lines.append(f"- `{t['task_id']}` [{t['status']}] {t['description'][:60]}{result_preview}")
+                text = "\n".join(lines)
             return {"content": [{"type": "text", "text": text}], "isError": False}
 
         return {"content": [{"type": "text", "text": f"Unknown tool: {name}"}], "isError": True}
