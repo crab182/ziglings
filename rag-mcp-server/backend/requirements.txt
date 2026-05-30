@@ -11,3 +11,5 @@ python-docx==1.1.2
 openpyxl==3.1.5
 chardet==5.2.0
 slowapi==0.1.9
+cryptography>=42.0
+APScheduler==3.10.4

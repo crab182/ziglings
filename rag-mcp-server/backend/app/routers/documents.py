@@ -4,7 +4,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 
 from app.config import settings
-from app.models.schemas import QueryRequest, QueryResponse, QueryResult
+from app.models.schemas import IngestTextRequest, QueryRequest, QueryResponse, QueryResult
 from app.services import rag_engine
 from app.services.document_parser import can_parse, parse_file
 from app.services.security import (
@@ -141,3 +141,39 @@ async def delete_collection(name: str, _: dict = Depends(require_admin_key)):
         raise HTTPException(400, "Cannot delete default collection")
     rag_engine.delete_collection(name)
     return {"name": name, "deleted": True}
+
+
+@router.get("/content")
+async def get_document_content(
+    source: str,
+    collection: str = "default",
+    _: dict = Depends(require_api_key),
+):
+    """Reconstruct full document content from its chunks, ordered by chunk_index."""
+    validate_collection_name(collection)
+    if not source or len(source) > 512:
+        raise HTTPException(400, "Invalid source parameter")
+    col = rag_engine.get_or_create_collection(collection)
+    results = col.get(where={"source": source}, include=["documents", "metadatas"])
+    if not results["ids"]:
+        raise HTTPException(404, "Document not found in this collection")
+    pairs = sorted(
+        zip(results["documents"], results["metadatas"]),
+        key=lambda p: p[1].get("chunk_index", 0),
+    )
+    content = "\n".join(doc for doc, _ in pairs)
+    return {
+        "source": source,
+        "collection": collection,
+        "content": content,
+        "chunk_count": len(pairs),
+    }
+
+
+@router.post("/ingest-text")
+async def ingest_text(req: IngestTextRequest, _: dict = Depends(require_admin_key)):
+    """Ingest raw text (e.g. from an MCP client) into the RAG."""
+    validate_collection_name(req.collection)
+    safe_source = safe_filename(req.source)
+    chunks = rag_engine.ingest_text(req.text, source=safe_source, collection_name=req.collection)
+    return {"source": safe_source, "collection": req.collection, "chunks_created": chunks}

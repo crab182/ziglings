@@ -1,5 +1,6 @@
 import logging
 import os
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,6 +11,7 @@ from slowapi.util import get_remote_address
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.routers import admin, documents, smb
+from app.services import scheduler
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -20,14 +22,26 @@ def _parse_origins(raw: str) -> list[str]:
     return origins or ["http://localhost", "http://127.0.0.1"]
 
 
-CORS_ORIGINS = _parse_origins(os.environ.get("CORS_ALLOWED_ORIGINS", "http://192.168.1.52:8902,http://localhost:8902"))
+CORS_ORIGINS = _parse_origins(os.environ.get(
+    "CORS_ALLOWED_ORIGINS",
+    "http://192.168.1.52:8902,http://localhost:8902,https://192.168.1.52:8943,https://localhost:8943",
+))
 
 limiter = Limiter(key_func=get_remote_address, default_limits=["120/minute"])
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    scheduler.start_scheduler()
+    yield
+    scheduler.shutdown()
+
 
 app = FastAPI(
     title="RAG MCP Server - Backend API",
     description="Document RAG engine with MCP server",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 app.state.limiter = limiter
