@@ -27,8 +27,8 @@ BACKEND_URL = os.environ.get("BACKEND_URL", "http://backend:8000")
 CONFIG_DIR = os.environ.get("CONFIG_DIR", "/app/data/config")
 CONFIG_FILE = Path(CONFIG_DIR) / "server_config.json"
 
-CORS_ORIGINS = [o.strip() for o in os.environ.get("CORS_ALLOWED_ORIGINS", "http://192.168.1.52:8902,http://localhost:8902").split(",") if o.strip()]
-ALLOWED_HOSTS = {h.strip() for h in os.environ.get("ALLOWED_HOSTS", "192.168.1.52:8901,192.168.1.52:8902,localhost:8901,localhost:8902,mcp-server:8001").split(",") if h.strip()}
+CORS_ORIGINS = [o.strip() for o in os.environ.get("CORS_ALLOWED_ORIGINS", "http://192.168.1.52:8902,http://localhost:8902,https://192.168.1.52:8943,https://localhost:8943").split(",") if o.strip()]
+ALLOWED_HOSTS = {h.strip() for h in os.environ.get("ALLOWED_HOSTS", "192.168.1.52:8901,192.168.1.52:8902,192.168.1.52:8943,localhost:8901,localhost:8902,localhost:8943,mcp-server:8001").split(",") if h.strip()}
 
 app = FastAPI(title="RAG MCP Server", version="1.0.0")
 
@@ -142,6 +142,31 @@ TOOLS = [
         "description": "Get the current status of the RAG server including document counts and available collections.",
         "inputSchema": {"type": "object", "properties": {}},
     },
+    {
+        "name": "get_document",
+        "description": "Retrieve the full content of a specific document by its source name. Returns all chunks joined in order.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "source": {"type": "string", "description": "The source identifier of the document (e.g. filename or smb:// path)"},
+                "collection": {"type": "string", "description": "Collection name (default: 'default')", "default": "default"},
+            },
+            "required": ["source"],
+        },
+    },
+    {
+        "name": "ingest_note",
+        "description": "Ingest a text note or document into the RAG system. Requires an admin-tier API key.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "The text content to ingest"},
+                "source": {"type": "string", "description": "A name/identifier for this text (e.g. 'meeting-notes-2025-05-30')"},
+                "collection": {"type": "string", "description": "Collection to ingest into (default: 'default')", "default": "default"},
+            },
+            "required": ["text", "source"],
+        },
+    },
 ]
 
 
@@ -195,6 +220,35 @@ async def handle_tool_call(name: str, arguments: dict, client_key: str) -> dict:
                 f"**Collections:** {', '.join(data['collections']) or 'none'}\n"
                 f"**Active API Keys:** {data['api_keys_count']}"
             )
+            return {"content": [{"type": "text", "text": text}], "isError": False}
+
+        elif name == "get_document":
+            source = arguments.get("source", "")
+            collection = arguments.get("collection", "default")
+            resp = await client.get("/api/documents/content", params={"source": source, "collection": collection})
+            if resp.status_code == 404:
+                return {"content": [{"type": "text", "text": f"Document not found: {source}"}], "isError": False}
+            resp.raise_for_status()
+            data = resp.json()
+            content = data.get("content", "")
+            MAX_CHARS = 100_000
+            if len(content) > MAX_CHARS:
+                content = content[:MAX_CHARS] + f"\n\n[Truncated — full document is {len(data['content'])} characters across {data['chunk_count']} chunks]"
+            text = f"**Source:** {data['source']} ({data['chunk_count']} chunks)\n**Collection:** {data['collection']}\n\n{content}"
+            return {"content": [{"type": "text", "text": text}], "isError": False}
+
+        elif name == "ingest_note":
+            note_text = arguments.get("text", "")
+            source = arguments.get("source", "")
+            collection = arguments.get("collection", "default")
+            resp = await client.post("/api/documents/ingest-text", json={
+                "text": note_text, "source": source, "collection": collection,
+            })
+            if resp.status_code == 403:
+                return {"content": [{"type": "text", "text": "Permission denied: admin API key required to ingest documents"}], "isError": True}
+            resp.raise_for_status()
+            data = resp.json()
+            text = f"Ingested **{data['source']}** into collection **{data['collection']}**: {data['chunks_created']} chunks created."
             return {"content": [{"type": "text", "text": text}], "isError": False}
 
         return {"content": [{"type": "text", "text": f"Unknown tool: {name}"}], "isError": True}

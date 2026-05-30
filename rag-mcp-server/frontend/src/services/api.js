@@ -90,6 +90,27 @@ export const listShares = (server, username = 'guest', password = '', domain = '
 export const ingestFromSMB = (config) =>
   request('/smb/ingest', { method: 'POST', body: JSON.stringify(config) });
 
+// Saved SMB shares
+export const listSavedShares = () => request('/smb/saved');
+
+export const saveShare = (config) =>
+  request('/smb/saved', { method: 'POST', body: JSON.stringify(config) });
+
+export const deleteSavedShare = (name) =>
+  request(`/smb/saved/${encodeURIComponent(name)}`, { method: 'DELETE' });
+
+export const ingestSavedShare = (name) =>
+  request(`/smb/saved/${encodeURIComponent(name)}/ingest`, { method: 'POST' });
+
+export const enableSync = (name) =>
+  request(`/smb/saved/${encodeURIComponent(name)}/sync/enable`, { method: 'POST' });
+
+export const disableSync = (name) =>
+  request(`/smb/saved/${encodeURIComponent(name)}/sync/disable`, { method: 'POST' });
+
+export const triggerSync = (name) =>
+  request(`/smb/saved/${encodeURIComponent(name)}/sync/trigger`, { method: 'POST' });
+
 // Admin
 export const getStatus = () => request('/admin/status');
 export const createAPIKey = (name, description = '', is_admin = false) =>
