@@ -156,12 +156,16 @@ async def handle_tool_call(name: str, arguments: dict, client_key: str) -> dict:
             })
             resp.raise_for_status()
             data = resp.json()
+            results = data["results"]
             results_text = [
                 f"**Source:** {r['source']} (score: {r['score']})\n{r['content']}"
-                for r in data["results"]
+                for r in results
             ]
             return {
-                "content": [{"type": "text", "text": "\n\n---\n\n".join(results_text) or "No results found."}],
+                "content": [
+                    {"type": "text", "text": "\n\n---\n\n".join(results_text) or "No results found."},
+                    {"type": "text", "text": json.dumps(results)},
+                ],
                 "isError": False,
             }
 
@@ -169,11 +173,19 @@ async def handle_tool_call(name: str, arguments: dict, client_key: str) -> dict:
             resp = await client.get("/api/documents/collections")
             resp.raise_for_status()
             data = resp.json()
+            collections = data["collections"]
             text = "\n".join(
                 f"- **{c['name']}**: {c['document_count']} documents"
-                for c in data["collections"]
+                for c in collections
             ) or "No collections found."
-            return {"content": [{"type": "text", "text": text}], "isError": False}
+            names = [c["name"] for c in collections]
+            return {
+                "content": [
+                    {"type": "text", "text": text},
+                    {"type": "text", "text": json.dumps(names)},
+                ],
+                "isError": False,
+            }
 
         elif name == "list_documents":
             collection = arguments.get("collection", "default")
@@ -182,7 +194,13 @@ async def handle_tool_call(name: str, arguments: dict, client_key: str) -> dict:
             data = resp.json()
             docs = data.get("documents", [])
             text = "\n".join(f"- {d}" for d in docs) or "No documents in this collection."
-            return {"content": [{"type": "text", "text": text}], "isError": False}
+            return {
+                "content": [
+                    {"type": "text", "text": text},
+                    {"type": "text", "text": json.dumps(docs)},
+                ],
+                "isError": False,
+            }
 
         elif name == "get_server_status":
             resp = await client.get("/api/admin/status")
@@ -195,7 +213,13 @@ async def handle_tool_call(name: str, arguments: dict, client_key: str) -> dict:
                 f"**Collections:** {', '.join(data['collections']) or 'none'}\n"
                 f"**Active API Keys:** {data['api_keys_count']}"
             )
-            return {"content": [{"type": "text", "text": text}], "isError": False}
+            return {
+                "content": [
+                    {"type": "text", "text": text},
+                    {"type": "text", "text": json.dumps(data)},
+                ],
+                "isError": False,
+            }
 
         return {"content": [{"type": "text", "text": f"Unknown tool: {name}"}], "isError": True}
 
