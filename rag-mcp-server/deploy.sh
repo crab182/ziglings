@@ -7,17 +7,45 @@ echo "  Target: BrownserverN5 (192.168.1.52)"
 echo "========================================="
 echo ""
 
-# Create data directories
-mkdir -p data/documents data/chromadb data/config data/certs
-
-# Copy env file if it doesn't exist
-if [ ! -f .env ]; then
-    cp .env.example .env
-    echo "[!] Created .env from template. Edit it to set your API key."
+# -----------------------------------------------
+# 1. Stop any existing deployment
+# -----------------------------------------------
+if docker compose ps -q 2>/dev/null | grep -q .; then
+    echo "[*] Stopping existing containers..."
+    docker compose down --remove-orphans
     echo ""
 fi
 
-# Generate self-signed TLS certificate (idempotent)
+# -----------------------------------------------
+# 2. Clean up old images and build cache
+# -----------------------------------------------
+echo "[*] Cleaning up old images and cache..."
+docker compose down --rmi local 2>/dev/null || true
+docker image prune -f 2>/dev/null || true
+echo ""
+
+# -----------------------------------------------
+# 3. Create data directories with correct ownership
+#    Backend runs as uid 10001, must be able to write
+#    config, chromadb, and documents volumes.
+# -----------------------------------------------
+echo "[*] Preparing data directories..."
+mkdir -p data/documents data/chromadb data/config data/certs
+chown -R 10001:10001 data/documents data/chromadb data/config
+echo "    Ownership set to uid 10001 (appuser)"
+
+# -----------------------------------------------
+# 4. Env file
+# -----------------------------------------------
+if [ ! -f .env ]; then
+    cp .env.example .env 2>/dev/null || true
+    echo "[!] Created .env from template."
+    echo ""
+fi
+
+# -----------------------------------------------
+# 5. Generate self-signed TLS certificate (idempotent)
+# -----------------------------------------------
 if [ ! -f data/certs/server.crt ]; then
     echo "[*] Generating self-signed TLS certificate..."
     openssl req -x509 -newkey rsa:2048 -nodes \
@@ -32,23 +60,43 @@ if [ ! -f data/certs/server.crt ]; then
     echo ""
 fi
 
+# -----------------------------------------------
+# 6. Build images
+# -----------------------------------------------
 echo "[1/3] Building Docker images..."
-docker compose build
+docker compose build --no-cache
 
+# -----------------------------------------------
+# 7. Start services
+# -----------------------------------------------
 echo ""
 echo "[2/3] Starting services..."
 docker compose up -d
 
+# -----------------------------------------------
+# 8. Wait and health-check
+# -----------------------------------------------
 echo ""
 echo "[3/3] Waiting for services to start..."
-sleep 5
+sleep 8
 
-# Health checks
 echo ""
 echo "Health checks:"
-curl -ksf https://localhost:8943/api/health && echo " - Backend: OK" || echo " - Backend: STARTING (may take a moment for model download)"
-curl -ksf https://localhost:8943/mcp/info > /dev/null 2>&1 && echo " - MCP Server: OK" || echo " - MCP Server: STARTING"
-curl -ksf https://localhost:8943/ > /dev/null 2>&1 && echo " - Frontend: OK" || echo " - Frontend: STARTING"
+
+ok=true
+curl -ksf https://localhost:8943/api/health 2>/dev/null && echo " - Backend: OK" || { echo " - Backend: STARTING (model download may take a moment)"; ok=false; }
+curl -ksf https://localhost:8943/mcp/info  >/dev/null 2>&1 && echo " - MCP Server: OK" || { echo " - MCP Server: STARTING"; ok=false; }
+curl -ksf https://localhost:8943/          >/dev/null 2>&1 && echo " - Frontend: OK" || { echo " - Frontend: STARTING"; ok=false; }
+
+if [ "$ok" = false ]; then
+    echo ""
+    echo "[*] Some services still starting. Waiting 15 more seconds..."
+    sleep 15
+    echo "Retry:"
+    curl -ksf https://localhost:8943/api/health 2>/dev/null && echo " - Backend: OK" || echo " - Backend: FAILED (check: docker logs rag-mcp-backend)"
+    curl -ksf https://localhost:8943/mcp/info  >/dev/null 2>&1 && echo " - MCP Server: OK" || echo " - MCP Server: FAILED (check: docker logs rag-mcp-server)"
+    curl -ksf https://localhost:8943/          >/dev/null 2>&1 && echo " - Frontend: OK" || echo " - Frontend: FAILED (check: docker logs rag-mcp-frontend)"
+fi
 
 echo ""
 echo "========================================="
