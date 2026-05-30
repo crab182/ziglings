@@ -46,7 +46,7 @@ function BootstrapForm({ onDone }) {
       const res = await createAPIKey(name, 'Bootstrap admin key', true)
       setNewKey(res.key)
     } catch (e) {
-      setErr(e.message)
+      setErr(e.message || 'Failed to create key. Check server logs.')
     } finally {
       setBusy(false)
     }
@@ -79,7 +79,7 @@ function BootstrapForm({ onDone }) {
           <label>Key name</label>
           <input value={name} onChange={e => setName(e.target.value)} required />
           {err && <div className="auth-error">{err}</div>}
-          <button disabled={busy} type="submit">{busy ? 'Creating…' : 'Create admin key'}</button>
+          <button disabled={busy} type="submit">{busy ? 'Creating...' : 'Create admin key'}</button>
         </form>
       </div>
     </div>
@@ -95,11 +95,12 @@ function LoginForm({ onDone }) {
     e.preventDefault()
     setBusy(true)
     setErr('')
-    setToken(key)
+    const trimmed = key.trim()
+    setToken(trimmed)
     try {
       await getStatus()
       onDone()
-    } catch (e) {
+    } catch {
       clearToken()
       setErr('Invalid API key')
     } finally {
@@ -118,13 +119,13 @@ function LoginForm({ onDone }) {
             type="password"
             value={key}
             onChange={e => setKey(e.target.value)}
-            placeholder="rmcp_…"
+            placeholder="rmcp_..."
             required
             autoFocus
           />
           {err && <div className="auth-error">{err}</div>}
-          <button disabled={busy || !key} type="submit">
-            {busy ? 'Signing in…' : 'Sign in'}
+          <button disabled={busy || !key.trim()} type="submit">
+            {busy ? 'Signing in...' : 'Sign in'}
           </button>
         </form>
       </div>
@@ -134,7 +135,7 @@ function LoginForm({ onDone }) {
 
 export default function App() {
   const [activePage, setActivePage] = useState('dashboard')
-  const [authState, setAuthState] = useState('checking') // checking | bootstrap | login | ready
+  const [authState, setAuthState] = useState('checking')
   const PageComponent = PAGE_COMPONENTS[activePage]
 
   useEffect(() => { evaluateAuth() }, [])
@@ -146,18 +147,21 @@ export default function App() {
         setAuthState('bootstrap')
         return
       }
-      if (!getToken()) {
-        setAuthState('login')
-        return
-      }
-      try {
-        await getStatus()
-        setAuthState('ready')
-      } catch {
-        clearToken()
-        setAuthState('login')
-      }
     } catch {
+      // If bootstrap check itself fails (e.g. server still starting),
+      // fall through to try token-based auth
+    }
+
+    if (!getToken()) {
+      setAuthState('login')
+      return
+    }
+
+    try {
+      await getStatus()
+      setAuthState('ready')
+    } catch {
+      clearToken()
       setAuthState('login')
     }
   }
@@ -167,8 +171,8 @@ export default function App() {
     setAuthState('login')
   }
 
-  if (authState === 'checking') return <div className="auth-screen"><p>Loading…</p></div>
-  if (authState === 'bootstrap') return <BootstrapForm onDone={evaluateAuth} />
+  if (authState === 'checking') return <div className="auth-screen"><p>Loading...</p></div>
+  if (authState === 'bootstrap') return <BootstrapForm onDone={() => setAuthState('ready')} />
   if (authState === 'login') return <LoginForm onDone={() => setAuthState('ready')} />
 
   return (

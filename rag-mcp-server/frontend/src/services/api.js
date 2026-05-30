@@ -3,7 +3,8 @@ const TOKEN_KEY = 'rmcp_api_key';
 
 export const getToken = () => localStorage.getItem(TOKEN_KEY) || '';
 export const setToken = (token) => {
-  if (token) localStorage.setItem(TOKEN_KEY, token);
+  const trimmed = token ? token.trim() : '';
+  if (trimmed) localStorage.setItem(TOKEN_KEY, trimmed);
   else localStorage.removeItem(TOKEN_KEY);
 };
 export const clearToken = () => localStorage.removeItem(TOKEN_KEY);
