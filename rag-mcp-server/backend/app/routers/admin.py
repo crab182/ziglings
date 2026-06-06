@@ -3,7 +3,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException
 
 from app.config import load_config, save_config, settings
-from app.models.schemas import APIKeyCreate, APIKeyResponse, ServerStatus
+from app.models.schemas import APIKeyCreate
 from app.services import auth, rag_engine
 from app.services.security import require_admin_key, require_api_key
 
@@ -18,19 +18,19 @@ async def get_status(_: dict = Depends(require_api_key)):
         collections = rag_engine.list_collections()
         total_docs = sum(c["document_count"] for c in collections)
         collection_names = [c["name"] for c in collections]
-    except Exception:
+    except Exception as e:
         logger.exception("Failed to query collections for status")
         collections = []
         total_docs = 0
         collection_names = []
-    return ServerStatus(
-        hostname=settings.server_hostname,
-        ip=settings.server_ip,
-        mcp_enabled=config.get("mcp_enabled", True),
-        total_documents=total_docs,
-        collections=collection_names,
-        api_keys_count=len([k for k in config.get("api_keys", []) if k.get("active", True)]),
-    )
+    return {
+        "hostname": settings.server_hostname,
+        "ip": settings.server_ip,
+        "mcp_enabled": config.get("mcp_enabled", True),
+        "total_documents": total_docs,
+        "collections": collection_names,
+        "api_keys_count": len([k for k in config.get("api_keys", []) if k.get("active", True)]),
+    }
 
 
 @router.post("/api-keys")
