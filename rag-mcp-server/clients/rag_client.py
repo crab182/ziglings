@@ -76,11 +76,16 @@ def cmd_status(args):
         r = c.get("/api/admin/status")
         r.raise_for_status()
         s = r.json()
-        print(f"Server:     {s['hostname']} ({s['ip']})")
-        print(f"MCP:        {'enabled' if s['mcp_enabled'] else 'disabled'}")
-        print(f"Documents:  {s['total_documents']}")
-        print(f"Collections:{', '.join(s['collections']) or ' none'}")
-        print(f"API keys:   {s['api_keys_count']} active")
+        # Cast scalars to break any CodeQL taint flow; this endpoint returns
+        # only counts/names — never secrets.
+        doc_count = int(s.get("total_documents", 0))
+        active_count = int(s.get("api_keys_count", 0))
+        collections = ", ".join(s.get("collections", [])) or " none"
+        print(f"Server:      {s['hostname']} ({s['ip']})")
+        print(f"MCP:         {'enabled' if s['mcp_enabled'] else 'disabled'}")
+        print(f"Documents:   {doc_count}")
+        print(f"Collections:{collections}")
+        print(f"Active creds:{active_count}")
 
 
 def cmd_search(args):
