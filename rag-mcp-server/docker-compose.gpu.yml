@@ -16,7 +16,7 @@ services:
   backend:
     build:
       args:
-        TORCH_VARIANT: cu124   # CUDA 12.4 wheels; matches recent drivers
+        TORCH_VARIANT: cu128   # CUDA 12.8 — required for Blackwell/sm_120 (5070)
     environment:
       - EMBEDDING_DEVICE=cuda
       - NVIDIA_VISIBLE_DEVICES=all

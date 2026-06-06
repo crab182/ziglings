@@ -27,6 +27,10 @@ BACKEND_URL = os.environ.get("BACKEND_URL", "http://backend:8000")
 CONFIG_DIR = os.environ.get("CONFIG_DIR", "/app/data/config")
 CONFIG_FILE = Path(CONFIG_DIR) / "server_config.json"
 
+# Server-issued credential for backend calls (spec forbids forwarding client tokens).
+# Set MCP_BACKEND_KEY to a dedicated admin key created for the MCP service.
+MCP_BACKEND_KEY = os.environ.get("MCP_BACKEND_KEY", "")
+
 CORS_ORIGINS = [o.strip() for o in os.environ.get("CORS_ALLOWED_ORIGINS", "http://192.168.1.52:8902,http://localhost:8902,https://192.168.1.52:8943,https://localhost:8943").split(",") if o.strip()]
 ALLOWED_HOSTS = {h.strip() for h in os.environ.get("ALLOWED_HOSTS", "192.168.1.52:8901,192.168.1.52:8902,192.168.1.52:8943,localhost:8901,localhost:8902,localhost:8943,mcp-server:8001").split(",") if h.strip()}
 
@@ -170,8 +174,9 @@ TOOLS = [
 ]
 
 
-async def handle_tool_call(name: str, arguments: dict, client_key: str) -> dict:
-    headers = {"Authorization": f"Bearer {client_key}"}
+async def handle_tool_call(name: str, arguments: dict) -> dict:
+    # Use the MCP server's own credential — never forward the client's token.
+    headers = {"Authorization": f"Bearer {MCP_BACKEND_KEY}"} if MCP_BACKEND_KEY else {}
     async with httpx.AsyncClient(base_url=BACKEND_URL, timeout=60.0, headers=headers) as client:
         if name == "search_documents":
             resp = await client.post("/api/documents/query", json={
@@ -323,7 +328,7 @@ async def handle_message(
     authorization: str | None = Header(None),
 ):
     check_origin(request)
-    client_key = get_api_key(authorization)
+    get_api_key(authorization)
 
     if session_id not in sessions:
         raise HTTPException(404, "Session not found")
@@ -340,7 +345,7 @@ async def handle_message(
         tool_name = params.get("name", "")
         tool_args = params.get("arguments", {})
         try:
-            tool_result = await handle_tool_call(tool_name, tool_args, client_key)
+            tool_result = await handle_tool_call(tool_name, tool_args)
         except Exception:
             logger.exception("Tool call failed: %s", tool_name)
             tool_result = {"content": [{"type": "text", "text": "Tool execution failed"}], "isError": True}
@@ -359,7 +364,7 @@ async def handle_message(
 @app.post("/mcp")
 async def mcp_streamable(request: Request, authorization: str | None = Header(None)):
     check_origin(request)
-    client_key = get_api_key(authorization)
+    get_api_key(authorization)
 
     body = await request.json()
     logger.info(f"MCP streamable request: {body.get('method', 'unknown')}")
@@ -373,7 +378,7 @@ async def mcp_streamable(request: Request, authorization: str | None = Header(No
         tool_name = params.get("name", "")
         tool_args = params.get("arguments", {})
         try:
-            tool_result = await handle_tool_call(tool_name, tool_args, client_key)
+            tool_result = await handle_tool_call(tool_name, tool_args)
         except Exception:
             logger.exception("Tool call failed: %s", tool_name)
             tool_result = {"content": [{"type": "text", "text": "Tool execution failed"}], "isError": True}
