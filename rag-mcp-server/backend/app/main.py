@@ -1,6 +1,7 @@
 import logging
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,7 +12,6 @@ from slowapi.util import get_remote_address
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.routers import admin, documents, smb
-from app.services import scheduler
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -32,9 +32,32 @@ limiter = Limiter(key_func=get_remote_address, default_limits=["120/minute"])
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    scheduler.start_scheduler()
+    # Verify config dir is writable
+    from app.config import settings
+    config_dir = Path(settings.config_dir)
+    config_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        test_file = config_dir / ".startup_test"
+        test_file.write_text("ok")
+        test_file.unlink()
+        logger.info("Config directory writable: %s", config_dir)
+    except Exception:
+        logger.error("CONFIG DIR NOT WRITABLE: %s — auth and saved shares will fail!", config_dir)
+
+    # Start scheduler (non-fatal if it fails)
+    try:
+        from app.services import scheduler
+        scheduler.start_scheduler()
+    except Exception:
+        logger.exception("Scheduler failed to start (non-fatal, sync will be unavailable)")
+
     yield
-    scheduler.shutdown()
+
+    try:
+        from app.services import scheduler
+        scheduler.shutdown()
+    except Exception:
+        pass
 
 
 app = FastAPI(
