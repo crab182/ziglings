@@ -78,7 +78,7 @@ sleep 8
 echo ""
 echo "Health checks:"
 check_health() {
-    curl -ksf https://localhost:8943/api/health 2>/dev/null && echo " - Backend: OK" && return 0
+    curl -ksf https://localhost:8943/health 2>/dev/null && echo " - Backend: OK" && return 0
     echo " - Backend: not ready yet"
     return 1
 }
