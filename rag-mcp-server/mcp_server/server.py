@@ -67,29 +67,32 @@ def load_config() -> dict:
     return {"api_keys": [], "mcp_enabled": True}
 
 
-def validate_api_key(key: str) -> bool:
+def validate_api_key(key: str) -> dict | None:
+    """Return the key entry on success (includes is_admin), None on failure."""
     if not key:
-        return False
+        return None
     config = load_config()
     if not config.get("mcp_enabled", True):
-        return False
+        return None
     hashed = hashlib.sha256(key.encode()).hexdigest()
-    valid = False
+    match = None
     for entry in config.get("api_keys", []):
         if not entry.get("active", True):
             continue
         if hmac.compare_digest(entry["key_hash"], hashed):
-            valid = True
-    return valid
+            match = entry
+    return match
 
 
-def get_api_key(authorization: str | None) -> str:
+def get_api_key(authorization: str | None) -> dict:
+    """Validate and return the key entry dict. Raises 401/403."""
     if not authorization:
         raise HTTPException(401, "Missing Authorization header")
     key = authorization[7:].strip() if authorization.startswith("Bearer ") else authorization.strip()
-    if not validate_api_key(key):
+    entry = validate_api_key(key)
+    if not entry:
         raise HTTPException(403, "Invalid or inactive API key")
-    return key
+    return entry
 
 
 def check_origin(request: Request) -> None:
@@ -174,7 +177,12 @@ TOOLS = [
 ]
 
 
-async def handle_tool_call(name: str, arguments: dict) -> dict:
+ADMIN_TOOLS = {"ingest_note"}
+
+
+async def handle_tool_call(name: str, arguments: dict, caller_is_admin: bool) -> dict:
+    if name in ADMIN_TOOLS and not caller_is_admin:
+        return {"content": [{"type": "text", "text": "Permission denied: admin API key required"}], "isError": True}
     # Use the MCP server's own credential — never forward the client's token.
     headers = {"Authorization": f"Bearer {MCP_BACKEND_KEY}"} if MCP_BACKEND_KEY else {}
     async with httpx.AsyncClient(base_url=BACKEND_URL, timeout=60.0, headers=headers) as client:
@@ -352,7 +360,7 @@ async def handle_message(
     authorization: str | None = Header(None),
 ):
     check_origin(request)
-    get_api_key(authorization)
+    caller = get_api_key(authorization)
 
     if session_id not in sessions:
         raise HTTPException(404, "Session not found")
@@ -369,7 +377,7 @@ async def handle_message(
         tool_name = params.get("name", "")
         tool_args = params.get("arguments", {})
         try:
-            tool_result = await handle_tool_call(tool_name, tool_args)
+            tool_result = await handle_tool_call(tool_name, tool_args, caller.get("is_admin", False))
         except Exception:
             logger.exception("Tool call failed: %s", tool_name)
             tool_result = {"content": [{"type": "text", "text": "Tool execution failed"}], "isError": True}
@@ -388,7 +396,7 @@ async def handle_message(
 @app.post("/mcp")
 async def mcp_streamable(request: Request, authorization: str | None = Header(None)):
     check_origin(request)
-    get_api_key(authorization)
+    caller = get_api_key(authorization)
 
     body = await request.json()
     logger.info(f"MCP streamable request: {body.get('method', 'unknown')}")
@@ -402,7 +410,7 @@ async def mcp_streamable(request: Request, authorization: str | None = Header(No
         tool_name = params.get("name", "")
         tool_args = params.get("arguments", {})
         try:
-            tool_result = await handle_tool_call(tool_name, tool_args)
+            tool_result = await handle_tool_call(tool_name, tool_args, caller.get("is_admin", False))
         except Exception:
             logger.exception("Tool call failed: %s", tool_name)
             tool_result = {"content": [{"type": "text", "text": "Tool execution failed"}], "isError": True}

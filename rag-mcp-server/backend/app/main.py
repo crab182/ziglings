@@ -4,7 +4,7 @@ import traceback
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -13,6 +13,7 @@ from slowapi.util import get_remote_address
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.routers import admin, documents, smb
+from app.services.security import require_admin_key
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -115,8 +116,8 @@ async def health():
 
 
 @app.get("/api/debug")
-async def debug_status():
-    """Diagnostic endpoint — reports the state of every subsystem."""
+async def debug_status(_: dict = Depends(require_admin_key)):
+    """Diagnostic endpoint — reports the state of every subsystem. Admin only."""
     report = {
         "config": {"status": "unknown"},
         "chromadb": {"status": "unknown"},
