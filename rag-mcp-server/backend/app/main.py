@@ -42,20 +42,20 @@ async def lifespan(app: FastAPI):
         test_file.unlink()
         logger.info("Config directory writable: %s", config_dir)
     except Exception:
-        logger.error("CONFIG DIR NOT WRITABLE: %s — auth and saved shares will fail!", config_dir)
+        logger.error("CONFIG DIR NOT WRITABLE: %s", config_dir)
 
-    # Start scheduler (non-fatal if it fails)
+    # Start scheduler — completely non-fatal
     try:
-        from app.services import scheduler
-        scheduler.start_scheduler()
+        from app.services.scheduler import start_scheduler
+        start_scheduler()
     except Exception:
-        logger.exception("Scheduler failed to start (non-fatal, sync will be unavailable)")
+        logger.warning("Scheduler unavailable (non-fatal): %s", __import__('traceback').format_exc())
 
     yield
 
     try:
-        from app.services import scheduler
-        scheduler.shutdown()
+        from app.services.scheduler import shutdown
+        shutdown()
     except Exception:
         pass
 

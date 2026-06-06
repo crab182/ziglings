@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
 
-@router.get("/status", response_model=ServerStatus)
+@router.get("/status")
 async def get_status(_: dict = Depends(require_api_key)):
     config = load_config()
     try:
@@ -52,7 +52,7 @@ async def create_api_key(req: APIKeyCreate, caller: dict = Depends(require_admin
     }
 
 
-@router.get("/api-keys", response_model=list[APIKeyResponse])
+@router.get("/api-keys")
 async def list_api_keys(_: dict = Depends(require_admin_key)):
     return auth.list_api_keys()
 
