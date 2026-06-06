@@ -1,0 +1,30 @@
+# GPU override for NVIDIA acceleration (e.g. RTX 5070 via oculink).
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+#
+# Requirements on the Unraid host:
+#   - NVIDIA driver installed (Unraid: "Nvidia Driver" plugin)
+#   - nvidia-container-toolkit / runtime available to Docker
+#   - Verify with: nvidia-smi   (should list the 5070)
+#
+# This rebuilds the backend with a CUDA-enabled torch and reserves the GPU
+# for the backend container, which runs the sentence-transformers embedding
+# model on the GPU. The CPU-only path (plain docker-compose.yml) is unchanged.
+
+services:
+  backend:
+    build:
+      args:
+        TORCH_VARIANT: cu124   # CUDA 12.4 wheels; matches recent drivers
+    environment:
+      - EMBEDDING_DEVICE=cuda
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

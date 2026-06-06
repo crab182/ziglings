@@ -1,5 +1,6 @@
 import hashlib
 import logging
+import os
 from pathlib import Path
 
 import chromadb
@@ -14,12 +15,31 @@ _embedding_model: SentenceTransformer | None = None
 _chroma_client: chromadb.ClientAPI | None = None
 
 
+def _resolve_device() -> str:
+    """Pick the embedding device. EMBEDDING_DEVICE=auto|cpu|cuda (default auto)."""
+    requested = os.environ.get("EMBEDDING_DEVICE", "auto").lower()
+    if requested == "cpu":
+        return "cpu"
+    try:
+        import torch
+        if requested == "cuda":
+            if torch.cuda.is_available():
+                return "cuda"
+            logger.warning("EMBEDDING_DEVICE=cuda requested but no CUDA device found; falling back to CPU")
+            return "cpu"
+        # auto
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        return "cpu"
+
+
 def get_embedding_model() -> SentenceTransformer:
     global _embedding_model
     if _embedding_model is None:
-        logger.info(f"Loading embedding model: {settings.embedding_model}")
-        _embedding_model = SentenceTransformer(settings.embedding_model)
-        logger.info("Embedding model loaded")
+        device = _resolve_device()
+        logger.info("Loading embedding model %s on device=%s", settings.embedding_model, device)
+        _embedding_model = SentenceTransformer(settings.embedding_model, device=device)
+        logger.info("Embedding model loaded on %s", device)
     return _embedding_model
 
 

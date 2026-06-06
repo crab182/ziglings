@@ -2,12 +2,15 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+# TORCH_VARIANT: "cpu" (default) or a CUDA tag like "cu124" for GPU builds.
+ARG TORCH_VARIANT=cpu
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu \
+RUN pip install --no-cache-dir torch==2.5.1 --index-url https://download.pytorch.org/whl/${TORCH_VARIANT} \
     && pip install --no-cache-dir -r requirements.txt
 
 # Pre-download the embedding model

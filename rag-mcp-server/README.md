@@ -143,3 +143,66 @@ docker compose logs -f
 # Rebuild after changes
 docker compose build && docker compose up -d
 ```
+
+## GPU Acceleration (optional)
+
+The backend runs the embedding model on CPU by default. To use an NVIDIA GPU
+(e.g. an RTX 5070 over oculink) for faster embedding:
+
+**Host prerequisites (Unraid):**
+- Install the **Nvidia Driver** plugin
+- Ensure `nvidia-smi` lists the GPU
+- Docker has the NVIDIA runtime (the plugin provides it)
+
+**Deploy with GPU:**
+```bash
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+```
+
+This builds the backend with CUDA-enabled torch, reserves the GPU for the
+backend container, and sets `EMBEDDING_DEVICE=cuda`. The embedding model
+falls back to CPU automatically if no CUDA device is found, so it is safe.
+
+To go back to CPU, deploy with the plain `docker compose up -d --build`.
+
+## Local Client (`clients/rag_client.py`)
+
+A command-line client for any machine on the LAN — search, ingest folders of
+manuals, and fetch documents without the web UI. It can also embed query text
+locally on a connected GPU / neural chip (`--local-embed`) to offload that
+work from the server.
+
+```bash
+pip install httpx                       # minimal
+pip install sentence-transformers torch # only for --local-embed
+
+export RAG_URL=https://192.168.1.52:8943
+export RAG_KEY=rmcp_your_key_here
+
+python clients/rag_client.py --insecure status
+python clients/rag_client.py --insecure ingest-dir ./manuals --collection manuals
+python clients/rag_client.py --insecure search "how to reset" --collection manuals
+python clients/rag_client.py --insecure search "wifi setup" --local-embed
+```
+
+### Ingesting device manuals
+
+There is no automatic network scan or manual download (that would require
+crawling the internet and your LAN). The intended workflow:
+
+1. Collect the PDF manuals for your devices into a folder (or an SMB share).
+2. Ingest them with the local client (`ingest-dir`) or the **SMB Browser**
+   page in the web UI ("Ingest This Folder").
+3. Optionally save the SMB share and enable auto-sync so new manuals are
+   picked up automatically.
+
+## Testing / QA
+
+A self-contained QA suite exercises the full API (auth, bootstrap, CRUD,
+PDF parsing, input-validation edge cases) using in-memory stubs for the heavy
+ML dependencies — no GPU or vector DB required:
+
+```bash
+cd backend
+python tests/test_api.py        # exits non-zero on any failure
+```
