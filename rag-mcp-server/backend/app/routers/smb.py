@@ -6,7 +6,6 @@ from fastapi import APIRouter, Depends, HTTPException
 from app.models.schemas import (
     IngestSMBRequest,
     SavedShareCreate,
-    SavedShareInfo,
     SMBBrowseRequest,
     SMBFileEntry,
     SMBListSharesRequest,
@@ -60,7 +59,7 @@ async def ingest_from_smb(req: IngestSMBRequest, _: dict = Depends(require_admin
 # Saved share profiles (encrypted creds at rest)
 # ---------------------------------------------------------------------------
 
-@router.get("/saved", response_model=list[SavedShareInfo])
+@router.get("/saved")
 async def list_saved_shares(_: dict = Depends(require_admin_key)):
     shares = smb_shares.list_saved()
     for s in shares:
@@ -68,7 +67,7 @@ async def list_saved_shares(_: dict = Depends(require_admin_key)):
     return shares
 
 
-@router.post("/saved", response_model=SavedShareInfo)
+@router.post("/saved")
 async def save_share(req: SavedShareCreate, _: dict = Depends(require_admin_key)):
     validate_collection_name(req.collection)
     entry = smb_shares.save_share(req.model_dump())
