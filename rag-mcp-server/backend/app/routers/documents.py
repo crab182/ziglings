@@ -4,7 +4,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 
 from app.config import settings
-from app.models.schemas import IngestTextRequest, QueryRequest, QueryResponse, QueryResult
+from app.models.schemas import IngestTextRequest, QueryRequest
 from app.services import rag_engine
 from app.services.document_parser import can_parse, parse_file
 from app.services.security import (
@@ -54,13 +54,10 @@ async def upload_document(
     return {"filename": filename, "collection": collection, "chunks_created": chunks}
 
 
-@router.post("/query", response_model=QueryResponse)
+@router.post("/query")
 async def query_documents(req: QueryRequest, _: dict = Depends(require_api_key)):
     results = rag_engine.query(req.query, collection_name=req.collection, n_results=req.n_results)
-    return QueryResponse(
-        results=[QueryResult(**r) for r in results],
-        query=req.query,
-    )
+    return {"results": results, "query": req.query}
 
 
 @router.get("/list")

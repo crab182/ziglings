@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react'
 import { queryDocuments, listCollections } from '../services/api'
+import HelpBubble from '../components/HelpBubble'
 
 export default function Search() {
   const [query, setQuery] = useState('')
@@ -37,7 +38,10 @@ export default function Search() {
       <div className="card">
         <div className="form-row">
           <div className="form-group" style={{ flex: 2 }}>
-            <label>Search Query</label>
+            <label>
+              Search Query
+              <HelpBubble title="Semantic search" text="Searches by meaning, not just keywords. Ask a natural-language question — e.g. 'how do I reset the router'." />
+            </label>
             <input
               className="input"
               placeholder="Enter your search query..."
@@ -47,7 +51,10 @@ export default function Search() {
             />
           </div>
           <div className="form-group">
-            <label>Collection</label>
+            <label>
+              Collection
+              <HelpBubble text="A named group of documents. Search runs only within the selected collection." />
+            </label>
             <select className="select" value={collection} onChange={e => setCollection(e.target.value)}>
               {collections.map(c => (
                 <option key={c.name} value={c.name}>{c.name} ({c.document_count})</option>
@@ -55,7 +62,10 @@ export default function Search() {
             </select>
           </div>
           <div className="form-group">
-            <label>Results</label>
+            <label>
+              Results
+              <HelpBubble text="How many of the most relevant chunks to return (1-20)." />
+            </label>
             <input
               className="input"
               type="number"

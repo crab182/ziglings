@@ -1,4 +1,5 @@
 import re
+from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -35,7 +36,7 @@ class QueryResult(BaseModel):
     content: str
     source: str
     score: float
-    metadata: dict
+    metadata: dict[str, Any]
 
 
 class QueryResponse(BaseModel):
@@ -152,7 +153,7 @@ class SavedShareInfo(BaseModel):
     auto_sync: bool = False
     interval_minutes: int = 60
     last_sync: str | None = None
-    last_result: dict | None = None
+    last_result: dict[str, Any] | None = None
     sync_running: bool = False
 
 

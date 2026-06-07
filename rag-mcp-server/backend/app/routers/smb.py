@@ -6,23 +6,40 @@ from fastapi import APIRouter, Depends, HTTPException
 from app.models.schemas import (
     IngestSMBRequest,
     SavedShareCreate,
-    SavedShareInfo,
     SMBBrowseRequest,
     SMBFileEntry,
     SMBListSharesRequest,
 )
-from app.services import scheduler, smb_browser, smb_shares
+from app.services import smb_browser
 from app.services.security import require_admin_key, validate_collection_name
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/smb", tags=["smb"])
 
 
+def _get_scheduler():
+    """Lazy import — scheduler depends on APScheduler + cryptography."""
+    try:
+        from app.services import scheduler
+        return scheduler
+    except Exception:
+        return None
+
+
+def _get_smb_shares():
+    """Lazy import — smb_shares depends on cryptography."""
+    try:
+        from app.services import smb_shares
+        return smb_shares
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Live SMB browsing (ad-hoc credentials)
 # ---------------------------------------------------------------------------
 
-@router.post("/browse", response_model=list[SMBFileEntry])
+@router.post("/browse")
 async def browse_smb(req: SMBBrowseRequest, _: dict = Depends(require_admin_key)):
     try:
         return smb_browser.browse_share(
@@ -47,6 +64,9 @@ async def list_shares(req: SMBListSharesRequest, _: dict = Depends(require_admin
 @router.post("/ingest")
 async def ingest_from_smb(req: IngestSMBRequest, _: dict = Depends(require_admin_key)):
     validate_collection_name(req.collection)
+    smb_shares = _get_smb_shares()
+    if not smb_shares:
+        raise HTTPException(503, "SMB shares service unavailable")
     result = await asyncio.to_thread(
         smb_shares.ingest_directory,
         server=req.server, share=req.share, path=req.path,
@@ -60,29 +80,45 @@ async def ingest_from_smb(req: IngestSMBRequest, _: dict = Depends(require_admin
 # Saved share profiles (encrypted creds at rest)
 # ---------------------------------------------------------------------------
 
-@router.get("/saved", response_model=list[SavedShareInfo])
+@router.get("/saved")
 async def list_saved_shares(_: dict = Depends(require_admin_key)):
+    smb_shares = _get_smb_shares()
+    sched = _get_scheduler()
+    if not smb_shares:
+        return []
     shares = smb_shares.list_saved()
     for s in shares:
-        s["sync_running"] = scheduler.is_running(s["name"])
+        s["sync_running"] = sched.is_running(s["name"]) if sched else False
     return shares
 
 
-@router.post("/saved", response_model=SavedShareInfo)
+@router.post("/saved")
 async def save_share(req: SavedShareCreate, _: dict = Depends(require_admin_key)):
     validate_collection_name(req.collection)
+    smb_shares = _get_smb_shares()
+    sched = _get_scheduler()
+    if not smb_shares:
+        raise HTTPException(503, "SMB shares service unavailable")
     entry = smb_shares.save_share(req.model_dump())
-    if req.auto_sync:
-        scheduler.reschedule(req.name, req.interval_minutes)
+    if sched:
+        if req.auto_sync:
+            sched.reschedule(req.name, req.interval_minutes)
+        else:
+            sched.unschedule(req.name)
+        entry["sync_running"] = sched.is_running(req.name)
     else:
-        scheduler.unschedule(req.name)
-    entry["sync_running"] = scheduler.is_running(req.name)
+        entry["sync_running"] = False
     return entry
 
 
 @router.delete("/saved/{name}")
 async def delete_saved_share(name: str, _: dict = Depends(require_admin_key)):
-    scheduler.unschedule(name)
+    smb_shares = _get_smb_shares()
+    sched = _get_scheduler()
+    if not smb_shares:
+        raise HTTPException(503, "SMB shares service unavailable")
+    if sched:
+        sched.unschedule(name)
     if smb_shares.delete_share(name):
         return {"deleted": True, "name": name}
     raise HTTPException(404, "Saved share not found")
@@ -90,6 +126,9 @@ async def delete_saved_share(name: str, _: dict = Depends(require_admin_key)):
 
 @router.post("/saved/{name}/ingest")
 async def ingest_saved_share(name: str, _: dict = Depends(require_admin_key)):
+    smb_shares = _get_smb_shares()
+    if not smb_shares:
+        raise HTTPException(503, "SMB shares service unavailable")
     share = smb_shares.get_decrypted(name)
     if not share:
         raise HTTPException(404, "Saved share not found")
@@ -113,6 +152,10 @@ async def ingest_saved_share(name: str, _: dict = Depends(require_admin_key)):
 
 @router.post("/saved/{name}/sync/enable")
 async def enable_sync(name: str, _: dict = Depends(require_admin_key)):
+    smb_shares = _get_smb_shares()
+    sched = _get_scheduler()
+    if not smb_shares:
+        raise HTTPException(503, "SMB shares service unavailable")
     share = smb_shares.get_decrypted(name)
     if not share:
         raise HTTPException(404, "Saved share not found")
@@ -123,12 +166,14 @@ async def enable_sync(name: str, _: dict = Depends(require_admin_key)):
             s["auto_sync"] = True
             break
     save_config(config)
-    scheduler.reschedule(name, share.get("interval_minutes", 60))
+    if sched:
+        sched.reschedule(name, share.get("interval_minutes", 60))
     return {"name": name, "auto_sync": True}
 
 
 @router.post("/saved/{name}/sync/disable")
 async def disable_sync(name: str, _: dict = Depends(require_admin_key)):
+    sched = _get_scheduler()
     from app.config import load_config, save_config
     config = load_config()
     for s in config.get("smb_shares", []):
@@ -136,16 +181,21 @@ async def disable_sync(name: str, _: dict = Depends(require_admin_key)):
             s["auto_sync"] = False
             break
     save_config(config)
-    scheduler.unschedule(name)
+    if sched:
+        sched.unschedule(name)
     return {"name": name, "auto_sync": False}
 
 
 @router.post("/saved/{name}/sync/trigger")
 async def trigger_sync(name: str, _: dict = Depends(require_admin_key)):
+    smb_shares = _get_smb_shares()
+    sched = _get_scheduler()
+    if not smb_shares or not sched:
+        raise HTTPException(503, "Scheduler unavailable")
     share = smb_shares.get_decrypted(name)
     if not share:
         raise HTTPException(404, "Saved share not found")
-    if scheduler.is_running(name):
+    if sched.is_running(name):
         raise HTTPException(409, "Sync already running for this share")
-    asyncio.create_task(scheduler.run_share_sync(name))
+    asyncio.create_task(sched.run_share_sync(name))
     return {"name": name, "triggered": True}
