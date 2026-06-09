@@ -49,12 +49,11 @@ async def list_agents(_: dict = Depends(require_api_key)):
 
 
 @router.get("/{agent_id}/status")
-async def get_agent_status(agent_id: str, _: dict = Depends(require_api_key)):
+async def get_agent_status(agent_id: str, caller: dict = Depends(require_api_key)):
     agent = agent_registry.get_agent(agent_id)
     if not agent:
         raise HTTPException(404, f"Agent not found: {agent_id}")
-    recent_tasks = agent_registry.get_tasks(agent_id, limit=5)
-    return {
+    response = {
         "agent_id": agent["agent_id"],
         "agent_type": agent["agent_type"],
         "status": agent.get("status", "unknown"),
@@ -62,8 +61,13 @@ async def get_agent_status(agent_id: str, _: dict = Depends(require_api_key)):
         "registered_at": agent.get("registered_at", ""),
         "last_heartbeat": agent.get("last_heartbeat", ""),
         "tasks_completed": agent.get("tasks_completed", 0),
-        "recent_tasks": recent_tasks,
     }
+    # Task bodies (payload/result) are admin-only: only admins submit tasks,
+    # so only admins may read them back. Non-admins get status without task details.
+    response["recent_tasks"] = (
+        agent_registry.get_tasks(agent_id, limit=5) if caller.get("is_admin", False) else []
+    )
+    return response
 
 
 @router.post("/register")
@@ -104,6 +108,7 @@ async def submit_task(agent_id: str, req: TaskSubmit, _: dict = Depends(require_
 
 
 @router.get("/{agent_id}/tasks")
-async def get_tasks(agent_id: str, limit: int = 10, _: dict = Depends(require_api_key)):
+async def get_tasks(agent_id: str, limit: int = 10, _: dict = Depends(require_admin_key)):
+    # Returns full task bodies (payload/result) — admin-only, matching task submission.
     tasks = agent_registry.get_tasks(agent_id, limit=min(limit, 100))
     return {"agent_id": agent_id, "tasks": tasks}

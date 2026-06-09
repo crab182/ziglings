@@ -219,7 +219,7 @@ TOOLS = [
 ]
 
 
-ADMIN_TOOLS = {"ingest_note", "submit_agent_task"}
+ADMIN_TOOLS = {"ingest_note", "submit_agent_task", "get_agent_tasks"}
 
 
 async def handle_tool_call(name: str, arguments: dict, caller_is_admin: bool) -> dict:
@@ -361,7 +361,10 @@ async def handle_tool_call(name: str, arguments: dict, caller_is_admin: bool) ->
                 f"**Last Heartbeat:** {a.get('last_heartbeat', '')}\n"
                 f"**Tasks Completed:** {a.get('tasks_completed', 0)}\n"
             )
-            recent = a.get("recent_tasks", [])
+            # Task bodies are admin-only; the backend redacts them for non-admin
+            # callers, and we additionally gate here since the MCP service calls
+            # the backend with its own admin credential.
+            recent = a.get("recent_tasks", []) if caller_is_admin else []
             if recent:
                 text += "\n**Recent Tasks:**\n"
                 for t in recent:
