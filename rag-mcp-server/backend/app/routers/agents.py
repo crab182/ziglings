@@ -1,9 +1,10 @@
 """Agent management endpoints."""
 
+import json
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.services import agent_registry
 from app.services.security import require_admin_key, require_api_key
@@ -11,12 +12,25 @@ from app.services.security import require_admin_key, require_api_key
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/agents", tags=["agents"])
 
+# Bounds for persisted agent config to keep agents.json from growing unbounded.
+MAX_CONFIG_KEYS = 50
+MAX_CONFIG_BYTES = 4096
+
 
 class AgentRegister(BaseModel):
-    agent_id: str = Field(min_length=1, max_length=64)
-    agent_type: str = Field(min_length=1, max_length=64)
-    container_name: str = Field(min_length=1, max_length=128)
+    agent_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    agent_type: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    container_name: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.-]+$")
     config: dict = {}
+
+    @field_validator("config")
+    @classmethod
+    def _bound_config(cls, v: dict) -> dict:
+        if len(v) > MAX_CONFIG_KEYS:
+            raise ValueError(f"config has too many keys (max {MAX_CONFIG_KEYS})")
+        if len(json.dumps(v)) > MAX_CONFIG_BYTES:
+            raise ValueError(f"config too large (max {MAX_CONFIG_BYTES} bytes serialized)")
+        return v
 
 
 class TaskSubmit(BaseModel):
@@ -71,7 +85,8 @@ async def get_agent_status(agent_id: str, caller: dict = Depends(require_api_key
 
 
 @router.post("/register")
-async def register_agent(req: AgentRegister, _: dict = Depends(require_api_key)):
+async def register_agent(req: AgentRegister, _: dict = Depends(require_admin_key)):
+    # Registration creates/updates a persistent agent record — admin-only.
     entry = agent_registry.register_agent(
         agent_id=req.agent_id,
         agent_type=req.agent_type,
@@ -91,11 +106,13 @@ async def deregister_agent(agent_id: str, _: dict = Depends(require_admin_key)):
 
 
 @router.post("/{agent_id}/heartbeat")
-async def heartbeat(agent_id: str, req: HeartbeatRequest, _: dict = Depends(require_api_key)):
+async def heartbeat(agent_id: str, req: HeartbeatRequest, _: dict = Depends(require_admin_key)):
+    # Heartbeats only update an already-registered agent. Unknown agents are
+    # rejected (no auto-registration) so a caller cannot spoof agents or grow
+    # agents.json with arbitrary identifiers.
     if agent_registry.update_heartbeat(agent_id, req.status, req.tasks_completed):
         return {"ok": True}
-    entry = agent_registry.register_agent(agent_id, "unknown", f"agent-{agent_id}")
-    return {"ok": True, "auto_registered": True}
+    raise HTTPException(404, f"Agent not registered: {agent_id}")
 
 
 @router.post("/{agent_id}/tasks")
