@@ -1,4 +1,5 @@
 import re
+from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -35,7 +36,7 @@ class QueryResult(BaseModel):
     content: str
     source: str
     score: float
-    metadata: dict
+    metadata: dict[str, Any]
 
 
 class QueryResponse(BaseModel):
@@ -119,3 +120,49 @@ class ServerStatus(BaseModel):
     total_documents: int
     collections: list[str]
     api_keys_count: int
+
+
+class SavedShareCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    server: str = Field(min_length=1, max_length=253)
+    share: str = Field(min_length=1, max_length=80)
+    path: str = Field(default="/", max_length=1024)
+    username: str = Field(default="guest", max_length=256)
+    password: str = Field(default="", max_length=256)
+    domain: str = Field(default="WORKGROUP", max_length=64)
+    collection: str = "default"
+    recursive: bool = True
+    auto_sync: bool = False
+    interval_minutes: int = Field(default=60, ge=5, le=10080)
+
+    @field_validator("collection")
+    @classmethod
+    def _v_collection(cls, v: str) -> str:
+        return _check_collection(v)
+
+
+class SavedShareInfo(BaseModel):
+    name: str
+    server: str
+    share: str
+    path: str = "/"
+    username: str = "guest"
+    domain: str = "WORKGROUP"
+    collection: str = "default"
+    recursive: bool = True
+    auto_sync: bool = False
+    interval_minutes: int = 60
+    last_sync: str | None = None
+    last_result: dict[str, Any] | None = None
+    sync_running: bool = False
+
+
+class IngestTextRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=1_000_000)
+    source: str = Field(min_length=1, max_length=512)
+    collection: str = "default"
+
+    @field_validator("collection")
+    @classmethod
+    def _v_collection(cls, v: str) -> str:
+        return _check_collection(v)

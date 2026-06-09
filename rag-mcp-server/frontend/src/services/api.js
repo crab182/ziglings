@@ -3,7 +3,8 @@ const TOKEN_KEY = 'rmcp_api_key';
 
 export const getToken = () => localStorage.getItem(TOKEN_KEY) || '';
 export const setToken = (token) => {
-  if (token) localStorage.setItem(TOKEN_KEY, token);
+  const trimmed = token ? token.trim() : '';
+  if (trimmed) localStorage.setItem(TOKEN_KEY, trimmed);
   else localStorage.removeItem(TOKEN_KEY);
 };
 export const clearToken = () => localStorage.removeItem(TOKEN_KEY);
@@ -89,6 +90,27 @@ export const listShares = (server, username = 'guest', password = '', domain = '
 
 export const ingestFromSMB = (config) =>
   request('/smb/ingest', { method: 'POST', body: JSON.stringify(config) });
+
+// Saved SMB shares
+export const listSavedShares = () => request('/smb/saved');
+
+export const saveShare = (config) =>
+  request('/smb/saved', { method: 'POST', body: JSON.stringify(config) });
+
+export const deleteSavedShare = (name) =>
+  request(`/smb/saved/${encodeURIComponent(name)}`, { method: 'DELETE' });
+
+export const ingestSavedShare = (name) =>
+  request(`/smb/saved/${encodeURIComponent(name)}/ingest`, { method: 'POST' });
+
+export const enableSync = (name) =>
+  request(`/smb/saved/${encodeURIComponent(name)}/sync/enable`, { method: 'POST' });
+
+export const disableSync = (name) =>
+  request(`/smb/saved/${encodeURIComponent(name)}/sync/disable`, { method: 'POST' });
+
+export const triggerSync = (name) =>
+  request(`/smb/saved/${encodeURIComponent(name)}/sync/trigger`, { method: 'POST' });
 
 // Admin
 export const getStatus = () => request('/admin/status');

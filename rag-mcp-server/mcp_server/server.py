@@ -27,8 +27,12 @@ BACKEND_URL = os.environ.get("BACKEND_URL", "http://backend:8000")
 CONFIG_DIR = os.environ.get("CONFIG_DIR", "/app/data/config")
 CONFIG_FILE = Path(CONFIG_DIR) / "server_config.json"
 
-CORS_ORIGINS = [o.strip() for o in os.environ.get("CORS_ALLOWED_ORIGINS", "http://192.168.1.52:8902,http://localhost:8902").split(",") if o.strip()]
-ALLOWED_HOSTS = {h.strip() for h in os.environ.get("ALLOWED_HOSTS", "192.168.1.52:8901,192.168.1.52:8902,localhost:8901,localhost:8902,mcp-server:8001").split(",") if h.strip()}
+# Server-issued credential for backend calls (spec forbids forwarding client tokens).
+# Set MCP_BACKEND_KEY to a dedicated admin key created for the MCP service.
+MCP_BACKEND_KEY = os.environ.get("MCP_BACKEND_KEY", "")
+
+CORS_ORIGINS = [o.strip() for o in os.environ.get("CORS_ALLOWED_ORIGINS", "http://192.168.1.52:8902,http://localhost:8902,https://192.168.1.52:8943,https://localhost:8943").split(",") if o.strip()]
+ALLOWED_HOSTS = {h.strip() for h in os.environ.get("ALLOWED_HOSTS", "192.168.1.52:8901,192.168.1.52:8902,192.168.1.52:8943,localhost:8901,localhost:8902,localhost:8943,mcp-server:8001").split(",") if h.strip()}
 
 app = FastAPI(title="RAG MCP Server", version="1.0.0")
 
@@ -63,29 +67,32 @@ def load_config() -> dict:
     return {"api_keys": [], "mcp_enabled": True}
 
 
-def validate_api_key(key: str) -> bool:
+def validate_api_key(key: str) -> dict | None:
+    """Return the key entry on success (includes is_admin), None on failure."""
     if not key:
-        return False
+        return None
     config = load_config()
     if not config.get("mcp_enabled", True):
-        return False
+        return None
     hashed = hashlib.sha256(key.encode()).hexdigest()
-    valid = False
+    match = None
     for entry in config.get("api_keys", []):
         if not entry.get("active", True):
             continue
         if hmac.compare_digest(entry["key_hash"], hashed):
-            valid = True
-    return valid
+            match = entry
+    return match
 
 
-def get_api_key(authorization: str | None) -> str:
+def get_api_key(authorization: str | None) -> dict:
+    """Validate and return the key entry dict. Raises 401/403."""
     if not authorization:
         raise HTTPException(401, "Missing Authorization header")
     key = authorization[7:].strip() if authorization.startswith("Bearer ") else authorization.strip()
-    if not validate_api_key(key):
+    entry = validate_api_key(key)
+    if not entry:
         raise HTTPException(403, "Invalid or inactive API key")
-    return key
+    return entry
 
 
 def check_origin(request: Request) -> None:
@@ -143,6 +150,31 @@ TOOLS = [
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
+        "name": "get_document",
+        "description": "Retrieve the full content of a specific document by its source name. Returns all chunks joined in order.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "source": {"type": "string", "description": "The source identifier of the document (e.g. filename or smb:// path)"},
+                "collection": {"type": "string", "description": "Collection name (default: 'default')", "default": "default"},
+            },
+            "required": ["source"],
+        },
+    },
+    {
+        "name": "ingest_note",
+        "description": "Ingest a text note or document into the RAG system. Requires an admin-tier API key.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "The text content to ingest"},
+                "source": {"type": "string", "description": "A name/identifier for this text (e.g. 'meeting-notes-2025-05-30')"},
+                "collection": {"type": "string", "description": "Collection to ingest into (default: 'default')", "default": "default"},
+            },
+            "required": ["text", "source"],
+        },
+    },
+    {
         "name": "list_agents",
         "description": "List all deployed AI agents on the server with their current status, type, and last heartbeat time.",
         "inputSchema": {"type": "object", "properties": {}},
@@ -160,7 +192,7 @@ TOOLS = [
     },
     {
         "name": "submit_agent_task",
-        "description": "Submit a task to a specific agent for execution. The task-runner agent accepts arbitrary tasks processed by Claude.",
+        "description": "Submit a task to a specific agent for execution. The task-runner agent accepts arbitrary tasks processed by Claude. Requires an admin-tier API key.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -187,8 +219,14 @@ TOOLS = [
 ]
 
 
-async def handle_tool_call(name: str, arguments: dict, client_key: str) -> dict:
-    headers = {"Authorization": f"Bearer {client_key}"}
+ADMIN_TOOLS = {"ingest_note", "submit_agent_task"}
+
+
+async def handle_tool_call(name: str, arguments: dict, caller_is_admin: bool) -> dict:
+    if name in ADMIN_TOOLS and not caller_is_admin:
+        return {"content": [{"type": "text", "text": "Permission denied: admin API key required"}], "isError": True}
+    # Use the MCP server's own credential — never forward the client's token.
+    headers = {"Authorization": f"Bearer {MCP_BACKEND_KEY}"} if MCP_BACKEND_KEY else {}
     async with httpx.AsyncClient(base_url=BACKEND_URL, timeout=60.0, headers=headers) as client:
         if name == "search_documents":
             resp = await client.post("/api/documents/query", json={
@@ -198,12 +236,16 @@ async def handle_tool_call(name: str, arguments: dict, client_key: str) -> dict:
             })
             resp.raise_for_status()
             data = resp.json()
+            results = data["results"]
             results_text = [
                 f"**Source:** {r['source']} (score: {r['score']})\n{r['content']}"
-                for r in data["results"]
+                for r in results
             ]
             return {
-                "content": [{"type": "text", "text": "\n\n---\n\n".join(results_text) or "No results found."}],
+                "content": [
+                    {"type": "text", "text": "\n\n---\n\n".join(results_text) or "No results found."},
+                    {"type": "text", "text": json.dumps(results)},
+                ],
                 "isError": False,
             }
 
@@ -211,11 +253,19 @@ async def handle_tool_call(name: str, arguments: dict, client_key: str) -> dict:
             resp = await client.get("/api/documents/collections")
             resp.raise_for_status()
             data = resp.json()
+            collections = data["collections"]
             text = "\n".join(
                 f"- **{c['name']}**: {c['document_count']} documents"
-                for c in data["collections"]
+                for c in collections
             ) or "No collections found."
-            return {"content": [{"type": "text", "text": text}], "isError": False}
+            names = [c["name"] for c in collections]
+            return {
+                "content": [
+                    {"type": "text", "text": text},
+                    {"type": "text", "text": json.dumps(names)},
+                ],
+                "isError": False,
+            }
 
         elif name == "list_documents":
             collection = arguments.get("collection", "default")
@@ -224,7 +274,13 @@ async def handle_tool_call(name: str, arguments: dict, client_key: str) -> dict:
             data = resp.json()
             docs = data.get("documents", [])
             text = "\n".join(f"- {d}" for d in docs) or "No documents in this collection."
-            return {"content": [{"type": "text", "text": text}], "isError": False}
+            return {
+                "content": [
+                    {"type": "text", "text": text},
+                    {"type": "text", "text": json.dumps(docs)},
+                ],
+                "isError": False,
+            }
 
         elif name == "get_server_status":
             resp = await client.get("/api/admin/status")
@@ -237,6 +293,41 @@ async def handle_tool_call(name: str, arguments: dict, client_key: str) -> dict:
                 f"**Collections:** {', '.join(data['collections']) or 'none'}\n"
                 f"**Active API Keys:** {data['api_keys_count']}"
             )
+            return {
+                "content": [
+                    {"type": "text", "text": text},
+                    {"type": "text", "text": json.dumps(data)},
+                ],
+                "isError": False,
+            }
+
+        elif name == "get_document":
+            source = arguments.get("source", "")
+            collection = arguments.get("collection", "default")
+            resp = await client.get("/api/documents/content", params={"source": source, "collection": collection})
+            if resp.status_code == 404:
+                return {"content": [{"type": "text", "text": f"Document not found: {source}"}], "isError": False}
+            resp.raise_for_status()
+            data = resp.json()
+            content = data.get("content", "")
+            MAX_CHARS = 100_000
+            if len(content) > MAX_CHARS:
+                content = content[:MAX_CHARS] + f"\n\n[Truncated — full document is {len(data['content'])} characters across {data['chunk_count']} chunks]"
+            text = f"**Source:** {data['source']} ({data['chunk_count']} chunks)\n**Collection:** {data['collection']}\n\n{content}"
+            return {"content": [{"type": "text", "text": text}], "isError": False}
+
+        elif name == "ingest_note":
+            note_text = arguments.get("text", "")
+            source = arguments.get("source", "")
+            collection = arguments.get("collection", "default")
+            resp = await client.post("/api/documents/ingest-text", json={
+                "text": note_text, "source": source, "collection": collection,
+            })
+            if resp.status_code == 403:
+                return {"content": [{"type": "text", "text": "Permission denied: admin API key required to ingest documents"}], "isError": True}
+            resp.raise_for_status()
+            data = resp.json()
+            text = f"Ingested **{data['source']}** into collection **{data['collection']}**: {data['chunks_created']} chunks created."
             return {"content": [{"type": "text", "text": text}], "isError": False}
 
         elif name == "list_agents":
@@ -379,7 +470,7 @@ async def handle_message(
     authorization: str | None = Header(None),
 ):
     check_origin(request)
-    client_key = get_api_key(authorization)
+    caller = get_api_key(authorization)
 
     if session_id not in sessions:
         raise HTTPException(404, "Session not found")
@@ -396,7 +487,7 @@ async def handle_message(
         tool_name = params.get("name", "")
         tool_args = params.get("arguments", {})
         try:
-            tool_result = await handle_tool_call(tool_name, tool_args, client_key)
+            tool_result = await handle_tool_call(tool_name, tool_args, caller.get("is_admin", False))
         except Exception:
             logger.exception("Tool call failed: %s", tool_name)
             tool_result = {"content": [{"type": "text", "text": "Tool execution failed"}], "isError": True}
@@ -415,7 +506,7 @@ async def handle_message(
 @app.post("/mcp")
 async def mcp_streamable(request: Request, authorization: str | None = Header(None)):
     check_origin(request)
-    client_key = get_api_key(authorization)
+    caller = get_api_key(authorization)
 
     body = await request.json()
     logger.info(f"MCP streamable request: {body.get('method', 'unknown')}")
@@ -429,7 +520,7 @@ async def mcp_streamable(request: Request, authorization: str | None = Header(No
         tool_name = params.get("name", "")
         tool_args = params.get("arguments", {})
         try:
-            tool_result = await handle_tool_call(tool_name, tool_args, client_key)
+            tool_result = await handle_tool_call(tool_name, tool_args, caller.get("is_admin", False))
         except Exception:
             logger.exception("Tool call failed: %s", tool_name)
             tool_result = {"content": [{"type": "text", "text": "Tool execution failed"}], "isError": True}
