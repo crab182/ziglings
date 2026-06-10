@@ -110,3 +110,16 @@ async def bootstrap_required():
     except Exception:
         logger.exception("Failed to check bootstrap status")
         return {"bootstrap_required": True}
+
+
+@router.get("/metrics")
+async def get_metrics(_: dict = Depends(require_admin_key)):
+    """Performance metrics: query/ingest counts and average latencies."""
+    m = rag_engine.get_metrics()
+    qc = m.get("query_count", 0)
+    return {
+        "query_count": qc,
+        "ingest_count": m.get("ingest_count", 0),
+        "avg_retrieve_ms": round(m.get("total_retrieve_ms", 0) / qc, 1) if qc else 0,
+        "avg_rerank_ms": round(m.get("total_rerank_ms", 0) / qc, 1) if qc else 0,
+    }

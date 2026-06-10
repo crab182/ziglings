@@ -174,6 +174,19 @@ TOOLS = [
             "required": ["text", "source"],
         },
     },
+    {
+        "name": "ask_documents",
+        "description": "Search documents and generate an answer using the local LLM. Returns a generated answer with cited sources. Falls back to search-only if no LLM is available.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "The question to answer from the documents"},
+                "collection": {"type": "string", "description": "Collection to search (default: 'default')", "default": "default"},
+                "n_results": {"type": "integer", "description": "Number of source chunks to use (default: 5)", "default": 5},
+            },
+            "required": ["query"],
+        },
+    },
 ]
 
 
@@ -286,6 +299,29 @@ async def handle_tool_call(name: str, arguments: dict, caller_is_admin: bool) ->
             resp.raise_for_status()
             data = resp.json()
             text = f"Ingested **{data['source']}** into collection **{data['collection']}**: {data['chunks_created']} chunks created."
+            return {"content": [{"type": "text", "text": text}], "isError": False}
+
+        elif name == "ask_documents":
+            resp = await client.post("/api/documents/ask", json={
+                "query": arguments.get("query", ""),
+                "collection": arguments.get("collection", "default"),
+                "n_results": min(max(int(arguments.get("n_results", 5)), 1), 50),
+            })
+            resp.raise_for_status()
+            data = resp.json()
+            parts = []
+            if data.get("answer"):
+                parts.append(f"**Answer** (via {data.get('model', 'LLM')}):\n{data['answer']}")
+            if data.get("sources"):
+                parts.append("**Sources:**")
+                for s in data["sources"]:
+                    cite = f"- {s['source']} (score: {s['score']})"
+                    if s.get("page"):
+                        cite += f" p.{s['page']}"
+                    if s.get("section"):
+                        cite += f" {s['section']}"
+                    parts.append(cite)
+            text = "\n\n".join(parts) if parts else "No results found."
             return {"content": [{"type": "text", "text": text}], "isError": False}
 
         return {"content": [{"type": "text", "text": f"Unknown tool: {name}"}], "isError": True}

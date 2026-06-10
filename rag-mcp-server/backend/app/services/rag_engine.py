@@ -8,6 +8,10 @@ from chromadb.config import Settings as ChromaSettings
 from sentence_transformers import SentenceTransformer
 
 from app.config import settings
+from app.services.sanitize import sanitize_chunk
+
+_reranker = None
+RERANKER_MODEL = os.environ.get("RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +70,7 @@ def get_or_create_collection(name: str = "default"):
 
 
 def chunk_text(text: str, chunk_size: int = 512, overlap: int = 64) -> list[str]:
+    """Simple word-based chunking for plain text."""
     words = text.split()
     chunks = []
     start = 0
@@ -78,27 +83,184 @@ def chunk_text(text: str, chunk_size: int = 512, overlap: int = 64) -> list[str]
     return chunks if chunks else [text]
 
 
+def _is_table_line(line: str) -> bool:
+    return line.strip().startswith("|") and "|" in line.strip()[1:]
+
+
+def _extract_page_number(text: str) -> int | None:
+    """Extract page number from Docling-style <!-- page N --> markers."""
+    import re
+    m = re.search(r"<!--\s*page\s+(\d+)\s*-->", text)
+    return int(m.group(1)) if m else None
+
+
+def chunk_text_structured(text: str, max_words: int = 512, overlap: int = 64) -> list[dict]:
+    """Markdown-aware chunker. Returns list of {text, section_header, page_number}."""
+    import re
+    sections: list[tuple[str, str]] = []  # (header, body)
+    current_header = ""
+    current_lines: list[str] = []
+
+    for line in text.split("\n"):
+        if re.match(r"^#{1,3}\s+", line):
+            if current_lines:
+                sections.append((current_header, "\n".join(current_lines)))
+                current_lines = []
+            current_header = line.lstrip("#").strip()
+        else:
+            current_lines.append(line)
+    if current_lines:
+        sections.append((current_header, "\n".join(current_lines)))
+
+    result: list[dict] = []
+
+    for header, body in sections:
+        paragraphs: list[str] = []
+        buf: list[str] = []
+        in_table = False
+
+        for line in body.split("\n"):
+            is_tbl = _is_table_line(line)
+            if is_tbl:
+                if not in_table and buf:
+                    paragraphs.append("\n".join(buf))
+                    buf = []
+                in_table = True
+                buf.append(line)
+            else:
+                if in_table:
+                    paragraphs.append("\n".join(buf))
+                    buf = []
+                    in_table = False
+                if line.strip() == "" and buf:
+                    paragraphs.append("\n".join(buf))
+                    buf = []
+                elif line.strip():
+                    buf.append(line)
+        if buf:
+            paragraphs.append("\n".join(buf))
+
+        merged = ""
+        for para in paragraphs:
+            candidate = (merged + "\n\n" + para).strip() if merged else para
+            if len(candidate.split()) <= max_words:
+                merged = candidate
+            else:
+                if merged:
+                    page = _extract_page_number(merged)
+                    result.append({"text": merged, "section_header": header, "page_number": page})
+                merged = para
+        if merged.strip():
+            page = _extract_page_number(merged)
+            result.append({"text": merged, "section_header": header, "page_number": page})
+
+    return result if result else [{"text": text, "section_header": "", "page_number": None}]
+
+
+def _get_reranker():
+    global _reranker
+    if _reranker is not None:
+        return _reranker
+    try:
+        from sentence_transformers import CrossEncoder
+        _reranker = CrossEncoder(RERANKER_MODEL)
+        logger.info("Loaded reranker: %s", RERANKER_MODEL)
+        return _reranker
+    except Exception as e:
+        logger.warning("Reranker unavailable (%s): %s", RERANKER_MODEL, e)
+        return None
+
+
+def _rerank(query: str, results: list[dict], top_k: int = 8) -> list[dict]:
+    """Re-score results with a cross-encoder and return top_k."""
+    reranker = _get_reranker()
+    if not reranker or not results:
+        return results[:top_k]
+    pairs = [(query, r["content"]) for r in results]
+    scores = reranker.predict(pairs)
+    for r, s in zip(results, scores):
+        r["rerank_score"] = round(float(s), 4)
+    results.sort(key=lambda r: r.get("rerank_score", 0), reverse=True)
+    return results[:top_k]
+
+
 def compute_doc_id(source: str, chunk_idx: int) -> str:
     return hashlib.sha256(f"{source}::{chunk_idx}".encode()).hexdigest()[:16]
 
 
+def _compute_content_hash(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def _check_content_hash(source: str, collection_name: str, content_hash: str) -> bool:
+    """Return True if the document is unchanged (same hash). Updates hash on change."""
+    from app.config import load_config, save_config
+    config = load_config()
+    hashes = config.setdefault("content_hashes", {}).setdefault(collection_name, {})
+    if hashes.get(source) == content_hash:
+        return True  # unchanged
+    hashes[source] = content_hash
+    save_config(config)
+    return False
+
+
+def _remove_content_hash(source: str, collection_name: str):
+    from app.config import load_config, save_config
+    config = load_config()
+    hashes = config.get("content_hashes", {}).get(collection_name, {})
+    if source in hashes:
+        del hashes[source]
+        save_config(config)
+
+
+def _looks_like_markdown(text: str) -> bool:
+    import re
+    return bool(re.search(r"^#{1,3}\s+", text, re.MULTILINE)) or _is_table_line(text.split("\n")[0] if text else "")
+
+
 def ingest_text(text: str, source: str, collection_name: str = "default", metadata: dict | None = None):
-    model = get_embedding_model()
-    collection = get_or_create_collection(collection_name)
-    chunks = chunk_text(text)
-    if not chunks:
+    content_hash = _compute_content_hash(text)
+    if _check_content_hash(source, collection_name, content_hash):
+        logger.info("Skipping %s in %s (content unchanged)", source, collection_name)
         return 0
 
-    ids = [compute_doc_id(source, i) for i in range(len(chunks))]
-    embeddings = model.encode(chunks).tolist()
-    metadatas = [
-        {**(metadata or {}), "source": source, "chunk_index": i}
-        for i in range(len(chunks))
-    ]
+    model = get_embedding_model()
+    collection = get_or_create_collection(collection_name)
 
-    collection.upsert(ids=ids, documents=chunks, embeddings=embeddings, metadatas=metadatas)
-    logger.info(f"Ingested {len(chunks)} chunks from {source} into {collection_name}")
-    return len(chunks)
+    if _looks_like_markdown(text):
+        structured = chunk_text_structured(text)
+        chunk_texts = [c["text"] for c in structured]
+        extra_meta = [
+            {"section_header": c.get("section_header", ""), "page_number": c.get("page_number")}
+            for c in structured
+        ]
+    else:
+        chunk_texts = chunk_text(text)
+        extra_meta = [{} for _ in chunk_texts]
+
+    if not chunk_texts:
+        return 0
+
+    ids = [compute_doc_id(source, i) for i in range(len(chunk_texts))]
+    embeddings = model.encode(chunk_texts).tolist()
+    metadatas = []
+    for i, (em,) in enumerate(zip(extra_meta)):
+        m = {**(metadata or {}), "source": source, "chunk_index": i}
+        if em.get("section_header"):
+            m["section_header"] = em["section_header"]
+        if em.get("page_number") is not None:
+            m["page_number"] = em["page_number"]
+        if i > 0:
+            m["prev_chunk_id"] = ids[i - 1]
+        if i < len(chunk_texts) - 1:
+            m["next_chunk_id"] = ids[i + 1]
+        metadatas.append(m)
+
+    collection.upsert(ids=ids, documents=chunk_texts, embeddings=embeddings, metadatas=metadatas)
+    _metrics["ingest_count"] += 1
+    logger.info("Ingested %d chunks from %s into %s (structured=%s)",
+                len(chunk_texts), source, collection_name, _looks_like_markdown(text))
+    return len(chunk_texts)
 
 
 def _bm25_search(query_text: str, collection_name: str, n_results: int) -> list[tuple[str, str, dict]]:
@@ -152,7 +314,16 @@ def _reciprocal_rank_fusion(
     return [{**docs[did], "score": round(scores[did], 4)} for did in ranked]
 
 
+_metrics = {"query_count": 0, "ingest_count": 0, "total_retrieve_ms": 0, "total_rerank_ms": 0}
+
+
+def get_metrics() -> dict:
+    return {**_metrics}
+
+
 def query(query_text: str, collection_name: str = "default", n_results: int = 5) -> list[dict]:
+    import time
+    t0 = time.monotonic()
     model = get_embedding_model()
     collection = get_or_create_collection(collection_name)
 
@@ -181,6 +352,8 @@ def query(query_text: str, collection_name: str = "default", n_results: int = 5)
             "metadata": meta,
         })
 
+    t_retrieve = time.monotonic()
+
     # BM25 sparse search + Reciprocal Rank Fusion
     bm25_hits = _bm25_search(query_text, collection_name, fetch_n)
     if bm25_hits:
@@ -188,7 +361,25 @@ def query(query_text: str, collection_name: str = "default", n_results: int = 5)
     else:
         fused = vector_hits
 
-    return fused[:n_results]
+    t_rerank_start = time.monotonic()
+    if len(fused) > n_results:
+        fused = _rerank(query_text, fused, top_k=n_results)
+    t_rerank = time.monotonic()
+
+    top = fused[:n_results]
+    for item in top:
+        item["content"] = sanitize_chunk(item["content"])
+
+    total_ms = round((time.monotonic() - t0) * 1000, 1)
+    retrieve_ms = round((t_retrieve - t0) * 1000, 1)
+    rerank_ms = round((t_rerank - t_rerank_start) * 1000, 1)
+    logger.info("Query [%s] %d results in %.0fms (retrieve=%.0f, rerank=%.0f)",
+                collection_name, len(top), total_ms, retrieve_ms, rerank_ms)
+    _metrics["query_count"] += 1
+    _metrics["total_retrieve_ms"] += retrieve_ms
+    _metrics["total_rerank_ms"] += rerank_ms
+
+    return top
 
 
 def delete_document(source: str, collection_name: str = "default"):
@@ -196,7 +387,8 @@ def delete_document(source: str, collection_name: str = "default"):
     results = collection.get(where={"source": source})
     if results["ids"]:
         collection.delete(ids=results["ids"])
-        logger.info(f"Deleted {len(results['ids'])} chunks for {source}")
+        _remove_content_hash(source, collection_name)
+        logger.info("Deleted %d chunks for %s", len(results["ids"]), source)
         return len(results["ids"])
     return 0
 

@@ -30,6 +30,7 @@ def _ensure_config():
             "smb_shares": [],
             "collections": ["default"],
             "mcp_enabled": True,
+            "content_hashes": {},
         }
         CONFIG_FILE.write_text(json.dumps(default, indent=2))
 

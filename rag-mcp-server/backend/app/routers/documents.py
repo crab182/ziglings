@@ -174,3 +174,33 @@ async def ingest_text(req: IngestTextRequest, _: dict = Depends(require_admin_ke
     safe_source = safe_filename(req.source)
     chunks = rag_engine.ingest_text(req.text, source=safe_source, collection_name=req.collection)
     return {"source": safe_source, "collection": req.collection, "chunks_created": chunks}
+
+
+@router.post("/ask")
+async def ask_documents(req: QueryRequest, _: dict = Depends(require_api_key)):
+    """Search + generate an answer using a local LLM (Ollama). Falls back to search-only."""
+    validate_collection_name(req.collection)
+    results = rag_engine.query(req.query, collection_name=req.collection, n_results=req.n_results)
+
+    try:
+        from app.services.llm import generate_answer
+        llm_result = await generate_answer(req.query, results)
+    except Exception:
+        logger.exception("LLM answer generation failed")
+        llm_result = {"answer": "", "model": ""}
+
+    sources = []
+    for r in results:
+        s = {"source": r["source"], "score": r["score"], "excerpt": r["content"][:200]}
+        if r.get("metadata", {}).get("page_number"):
+            s["page"] = r["metadata"]["page_number"]
+        if r.get("metadata", {}).get("section_header"):
+            s["section"] = r["metadata"]["section_header"]
+        sources.append(s)
+
+    return {
+        "answer": llm_result.get("answer", ""),
+        "model": llm_result.get("model", ""),
+        "query": req.query,
+        "sources": sources,
+    }
