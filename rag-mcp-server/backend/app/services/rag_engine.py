@@ -1,37 +1,43 @@
 import hashlib
 import logging
 import os
+import re
+import time
 from pathlib import Path
 
 import chromadb
 from chromadb.config import Settings as ChromaSettings
 from sentence_transformers import SentenceTransformer
 
-from app.config import settings
+from app.config import settings, atomic_update
 from app.services.sanitize import sanitize_chunk
 
-_reranker = None
 RERANKER_MODEL = os.environ.get("RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
 
 logger = logging.getLogger(__name__)
 
 _embedding_model: SentenceTransformer | None = None
 _chroma_client: chromadb.ClientAPI | None = None
+_reranker = None
 
+# Cached BM25 index per collection: {collection_name: (doc_count, BM25Okapi, all_data)}
+_bm25_cache: dict[str, tuple] = {}
+
+_metrics = {"query_count": 0, "ingest_count": 0, "total_retrieve_ms": 0, "total_rerank_ms": 0}
+
+
+# ---------------------------------------------------------------------------
+# Model / DB initialization
+# ---------------------------------------------------------------------------
 
 def _resolve_device() -> str:
-    """Pick the embedding device. EMBEDDING_DEVICE=auto|cpu|cuda (default auto)."""
     requested = os.environ.get("EMBEDDING_DEVICE", "auto").lower()
     if requested == "cpu":
         return "cpu"
     try:
         import torch
         if requested == "cuda":
-            if torch.cuda.is_available():
-                return "cuda"
-            logger.warning("EMBEDDING_DEVICE=cuda requested but no CUDA device found; falling back to CPU")
-            return "cpu"
-        # auto
+            return "cuda" if torch.cuda.is_available() else "cpu"
         return "cuda" if torch.cuda.is_available() else "cpu"
     except Exception:
         return "cpu"
@@ -43,7 +49,7 @@ def get_embedding_model() -> SentenceTransformer:
         device = _resolve_device()
         logger.info("Loading embedding model %s on device=%s", settings.embedding_model, device)
         _embedding_model = SentenceTransformer(settings.embedding_model, device=device)
-        logger.info("Embedding model loaded on %s", device)
+        logger.info("Embedding model loaded (%d-dim)", _embedding_model.get_sentence_embedding_dimension())
     return _embedding_model
 
 
@@ -55,7 +61,7 @@ def get_chroma_client() -> chromadb.ClientAPI:
             path=settings.chroma_persist_dir,
             settings=ChromaSettings(anonymized_telemetry=False),
         )
-        logger.info(f"ChromaDB initialized at {settings.chroma_persist_dir}")
+        logger.info("ChromaDB initialized at %s", settings.chroma_persist_dir)
     return _chroma_client
 
 
@@ -68,6 +74,10 @@ def get_or_create_collection(name: str = "default"):
         metadata={"hnsw:space": "cosine", "dimension": dim},
     )
 
+
+# ---------------------------------------------------------------------------
+# Chunking
+# ---------------------------------------------------------------------------
 
 def chunk_text(text: str, chunk_size: int = 512, overlap: int = 64) -> list[str]:
     """Simple word-based chunking for plain text."""
@@ -84,20 +94,18 @@ def chunk_text(text: str, chunk_size: int = 512, overlap: int = 64) -> list[str]
 
 
 def _is_table_line(line: str) -> bool:
-    return line.strip().startswith("|") and "|" in line.strip()[1:]
+    stripped = line.strip()
+    return stripped.startswith("|") and "|" in stripped[1:]
 
 
 def _extract_page_number(text: str) -> int | None:
-    """Extract page number from Docling-style <!-- page N --> markers."""
-    import re
     m = re.search(r"<!--\s*page\s+(\d+)\s*-->", text)
     return int(m.group(1)) if m else None
 
 
-def chunk_text_structured(text: str, max_words: int = 512, overlap: int = 64) -> list[dict]:
+def chunk_text_structured(text: str, max_words: int = 512) -> list[dict]:
     """Markdown-aware chunker. Returns list of {text, section_header, page_number}."""
-    import re
-    sections: list[tuple[str, str]] = []  # (header, body)
+    sections: list[tuple[str, str]] = []
     current_header = ""
     current_lines: list[str] = []
 
@@ -113,7 +121,6 @@ def chunk_text_structured(text: str, max_words: int = 512, overlap: int = 64) ->
         sections.append((current_header, "\n".join(current_lines)))
 
     result: list[dict] = []
-
     for header, body in sections:
         paragraphs: list[str] = []
         buf: list[str] = []
@@ -147,15 +154,29 @@ def chunk_text_structured(text: str, max_words: int = 512, overlap: int = 64) ->
                 merged = candidate
             else:
                 if merged:
-                    page = _extract_page_number(merged)
-                    result.append({"text": merged, "section_header": header, "page_number": page})
+                    result.append({"text": merged, "section_header": header, "page_number": _extract_page_number(merged)})
                 merged = para
         if merged.strip():
-            page = _extract_page_number(merged)
-            result.append({"text": merged, "section_header": header, "page_number": page})
+            result.append({"text": merged, "section_header": header, "page_number": _extract_page_number(merged)})
 
     return result if result else [{"text": text, "section_header": "", "page_number": None}]
 
+
+def _looks_like_markdown(text: str) -> bool:
+    if re.search(r"^#{1,3}\s+", text, re.MULTILINE):
+        return True
+    lines = text.split("\n")
+    table_lines = sum(1 for l in lines[:50] if _is_table_line(l))
+    if table_lines >= 2:
+        return True
+    if re.search(r"<!--\s*page\s+\d+\s*-->", text):
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Reranker
+# ---------------------------------------------------------------------------
 
 def _get_reranker():
     global _reranker
@@ -172,7 +193,6 @@ def _get_reranker():
 
 
 def _rerank(query: str, results: list[dict], top_k: int = 8) -> list[dict]:
-    """Re-score results with a cross-encoder and return top_k."""
     reranker = _get_reranker()
     if not reranker or not results:
         return results[:top_k]
@@ -184,6 +204,10 @@ def _rerank(query: str, results: list[dict], top_k: int = 8) -> list[dict]:
     return results[:top_k]
 
 
+# ---------------------------------------------------------------------------
+# Ingestion (with content-hash dedup under file lock)
+# ---------------------------------------------------------------------------
+
 def compute_doc_id(source: str, chunk_idx: int) -> str:
     return hashlib.sha256(f"{source}::{chunk_idx}".encode()).hexdigest()[:16]
 
@@ -193,29 +217,21 @@ def _compute_content_hash(text: str) -> str:
 
 
 def _check_content_hash(source: str, collection_name: str, content_hash: str) -> bool:
-    """Return True if the document is unchanged (same hash). Updates hash on change."""
-    from app.config import load_config, save_config
-    config = load_config()
-    hashes = config.setdefault("content_hashes", {}).setdefault(collection_name, {})
-    if hashes.get(source) == content_hash:
-        return True  # unchanged
-    hashes[source] = content_hash
-    save_config(config)
-    return False
+    """Atomic check-and-update under file lock. Returns True if unchanged."""
+    def _update(config):
+        hashes = config.setdefault("content_hashes", {}).setdefault(collection_name, {})
+        if hashes.get(source) == content_hash:
+            return True
+        hashes[source] = content_hash
+        return False
+    return atomic_update(_update)
 
 
 def _remove_content_hash(source: str, collection_name: str):
-    from app.config import load_config, save_config
-    config = load_config()
-    hashes = config.get("content_hashes", {}).get(collection_name, {})
-    if source in hashes:
-        del hashes[source]
-        save_config(config)
-
-
-def _looks_like_markdown(text: str) -> bool:
-    import re
-    return bool(re.search(r"^#{1,3}\s+", text, re.MULTILINE)) or _is_table_line(text.split("\n")[0] if text else "")
+    def _update(config):
+        hashes = config.get("content_hashes", {}).get(collection_name, {})
+        hashes.pop(source, None)
+    atomic_update(_update)
 
 
 def ingest_text(text: str, source: str, collection_name: str = "default", metadata: dict | None = None):
@@ -244,7 +260,7 @@ def ingest_text(text: str, source: str, collection_name: str = "default", metada
     ids = [compute_doc_id(source, i) for i in range(len(chunk_texts))]
     embeddings = model.encode(chunk_texts).tolist()
     metadatas = []
-    for i, (em,) in enumerate(zip(extra_meta)):
+    for i, em in enumerate(extra_meta):
         m = {**(metadata or {}), "source": source, "chunk_index": i}
         if em.get("section_header"):
             m["section_header"] = em["section_header"]
@@ -257,26 +273,37 @@ def ingest_text(text: str, source: str, collection_name: str = "default", metada
         metadatas.append(m)
 
     collection.upsert(ids=ids, documents=chunk_texts, embeddings=embeddings, metadatas=metadatas)
+    _bm25_cache.pop(collection_name, None)  # invalidate BM25 cache
     _metrics["ingest_count"] += 1
-    logger.info("Ingested %d chunks from %s into %s (structured=%s)",
-                len(chunk_texts), source, collection_name, _looks_like_markdown(text))
+    logger.info("Ingested %d chunks from %s into %s", len(chunk_texts), source, collection_name)
     return len(chunk_texts)
 
 
+# ---------------------------------------------------------------------------
+# BM25 search (cached index per collection)
+# ---------------------------------------------------------------------------
+
 def _bm25_search(query_text: str, collection_name: str, n_results: int) -> list[tuple[str, str, dict]]:
-    """BM25 keyword search over all chunks in a collection. Returns (id, doc, meta) tuples."""
     try:
         from rank_bm25 import BM25Okapi
     except ImportError:
         return []
     collection = get_or_create_collection(collection_name)
-    if collection.count() == 0:
+    count = collection.count()
+    if count == 0:
         return []
-    all_data = collection.get(include=["documents", "metadatas"])
-    if not all_data["documents"]:
-        return []
-    tokenized = [doc.lower().split() for doc in all_data["documents"]]
-    bm25 = BM25Okapi(tokenized)
+
+    cached = _bm25_cache.get(collection_name)
+    if cached and cached[0] == count:
+        _, bm25, all_data = cached
+    else:
+        all_data = collection.get(include=["documents", "metadatas"])
+        if not all_data["documents"]:
+            return []
+        tokenized = [doc.lower().split() for doc in all_data["documents"]]
+        bm25 = BM25Okapi(tokenized)
+        _bm25_cache[collection_name] = (count, bm25, all_data)
+
     scores = bm25.get_scores(query_text.lower().split())
     top_idx = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:n_results]
     return [
@@ -290,7 +317,6 @@ def _reciprocal_rank_fusion(
     bm25_results: list[tuple[str, str, dict]],
     k: int = 60,
 ) -> list[dict]:
-    """Combine vector + BM25 results via RRF. Returns fused list ranked by combined score."""
     scores: dict[str, float] = {}
     docs: dict[str, dict] = {}
 
@@ -314,15 +340,15 @@ def _reciprocal_rank_fusion(
     return [{**docs[did], "score": round(scores[did], 4)} for did in ranked]
 
 
-_metrics = {"query_count": 0, "ingest_count": 0, "total_retrieve_ms": 0, "total_rerank_ms": 0}
-
+# ---------------------------------------------------------------------------
+# Query (vector + BM25 + rerank + sanitize + observability)
+# ---------------------------------------------------------------------------
 
 def get_metrics() -> dict:
     return {**_metrics}
 
 
 def query(query_text: str, collection_name: str = "default", n_results: int = 5) -> list[dict]:
-    import time
     t0 = time.monotonic()
     model = get_embedding_model()
     collection = get_or_create_collection(collection_name)
@@ -330,7 +356,6 @@ def query(query_text: str, collection_name: str = "default", n_results: int = 5)
     if collection.count() == 0:
         return []
 
-    # Dense vector search — fetch extra candidates for fusion
     fetch_n = min(max(n_results * 5, 30), collection.count())
     query_embedding = model.encode([query_text]).tolist()
     results = collection.query(
@@ -354,7 +379,6 @@ def query(query_text: str, collection_name: str = "default", n_results: int = 5)
 
     t_retrieve = time.monotonic()
 
-    # BM25 sparse search + Reciprocal Rank Fusion
     bm25_hits = _bm25_search(query_text, collection_name, fetch_n)
     if bm25_hits:
         fused = _reciprocal_rank_fusion(vector_hits, bm25_hits)
@@ -382,12 +406,17 @@ def query(query_text: str, collection_name: str = "default", n_results: int = 5)
     return top
 
 
+# ---------------------------------------------------------------------------
+# Document management
+# ---------------------------------------------------------------------------
+
 def delete_document(source: str, collection_name: str = "default"):
     collection = get_or_create_collection(collection_name)
     results = collection.get(where={"source": source})
     if results["ids"]:
         collection.delete(ids=results["ids"])
         _remove_content_hash(source, collection_name)
+        _bm25_cache.pop(collection_name, None)
         logger.info("Deleted %d chunks for %s", len(results["ids"]), source)
         return len(results["ids"])
     return 0
@@ -421,4 +450,5 @@ def list_collections() -> list[dict]:
 def delete_collection(name: str):
     client = get_chroma_client()
     client.delete_collection(name)
-    logger.info(f"Deleted collection {name}")
+    _bm25_cache.pop(name, None)
+    logger.info("Deleted collection %s", name)

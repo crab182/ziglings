@@ -32,6 +32,9 @@ def sanitize_chunk(text: str) -> str:
     """Remove instruction-like markup and injection patterns from chunk text."""
     original_len = len(text)
 
+    # Normalize whitespace within lines to defeat split-token bypasses
+    text = re.sub(r"[ \t]+", " ", text)
+
     text = _INSTRUCTION_TAGS_RE.sub("", text)
     text = _BOLD_INSTRUCTION_RE.sub("", text)
 

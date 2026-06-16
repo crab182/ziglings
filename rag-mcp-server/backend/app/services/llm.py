@@ -36,6 +36,13 @@ async def generate_answer(query: str, context_chunks: list[dict]) -> dict:
 
     context_text = "\n\n".join(context_parts)
 
+    # Truncate to ~24k words (~32k tokens) to stay within most model context windows
+    MAX_CONTEXT_WORDS = 24000
+    words = context_text.split()
+    if len(words) > MAX_CONTEXT_WORDS:
+        context_text = " ".join(words[:MAX_CONTEXT_WORDS]) + "\n\n[Context truncated]"
+        logger.warning("LLM context truncated from %d to %d words", len(words), MAX_CONTEXT_WORDS)
+
     messages = [
         {"role": "system", "content": _SYSTEM_PROMPT},
         {"role": "user", "content": f"Context:\n{context_text}\n\nQuestion: {query}"},
