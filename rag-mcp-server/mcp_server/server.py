@@ -10,6 +10,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import uuid
 from pathlib import Path
 from typing import AsyncGenerator
@@ -201,6 +202,24 @@ TOOLS = [
 
 ADMIN_TOOLS = {"ingest_note", "create_collection", "delete_collection"}
 
+# Mirror of backend's COLLECTION_NAME_RE (services/security.py). The MCP
+# server uses MCP_BACKEND_KEY (admin) for backend calls, so an unvalidated
+# `name` interpolated into a request path can be exploited: httpx normalizes
+# `..` segments per RFC 3986, so e.g. `name="../../admin/api-keys/victim"`
+# would resolve to a backend admin endpoint before the backend's own
+# validator can reject it. We refuse the call before any request goes out.
+_COLLECTION_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+
+
+def _reject_bad_name(name: str) -> dict | None:
+    if not _COLLECTION_NAME_RE.match(name or ""):
+        return {
+            "content": [{"type": "text", "text":
+                "Collection name must be 1-64 chars: letters, digits, '_' or '-'"}],
+            "isError": True,
+        }
+    return None
+
 
 async def handle_tool_call(name: str, arguments: dict, caller_is_admin: bool) -> dict:
     if name in ADMIN_TOOLS and not caller_is_admin:
@@ -312,6 +331,9 @@ async def handle_tool_call(name: str, arguments: dict, caller_is_admin: bool) ->
 
         elif name == "create_collection":
             coll_name = arguments.get("name", "")
+            bad = _reject_bad_name(coll_name)
+            if bad:
+                return bad
             resp = await client.post(f"/api/documents/collections/{coll_name}")
             if resp.status_code == 400:
                 detail = _detail(resp)
@@ -329,6 +351,9 @@ async def handle_tool_call(name: str, arguments: dict, caller_is_admin: bool) ->
 
         elif name == "delete_collection":
             coll_name = arguments.get("name", "")
+            bad = _reject_bad_name(coll_name)
+            if bad:
+                return bad
             resp = await client.delete(f"/api/documents/collections/{coll_name}")
             if resp.status_code == 400:
                 # Backend rejects "default" with 400 and surfaces a detail message —

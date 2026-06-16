@@ -115,10 +115,13 @@ class CreateCollectionTests(unittest.TestCase):
                          {"name": "demo", "created": True})
 
     def test_400_returns_friendly_detail(self):
+        # Defense-in-depth: even though we validate client-side, a backend
+        # 400 (e.g. if the two regexes ever diverged) should still surface
+        # as friendly text, not a raise_for_status crash.
         result, _ = _call(
             "create_collection",
-            {"name": "../etc"},
-            responses={("POST", "/api/documents/collections/../etc"):
+            {"name": "demo"},
+            responses={("POST", "/api/documents/collections/demo"):
                        FakeResponse(400, {"detail": "Invalid collection name"})},
         )
         self.assertTrue(result["isError"])
@@ -153,6 +156,58 @@ class DeleteCollectionTests(unittest.TestCase):
         )
         self.assertTrue(result["isError"])
         self.assertEqual(result["content"][0]["text"], "Cannot delete default collection")
+
+
+class PathTraversalTests(unittest.TestCase):
+    """Regression: cursor[bot] flagged that httpx normalizes `..` segments,
+    so an unvalidated `name` interpolated into the URL path could redirect
+    the request to a backend admin endpoint (api-keys, MCP toggle, etc.) sent
+    with the server's admin-tier MCP_BACKEND_KEY."""
+
+    def test_create_rejects_traversal_payload_without_request(self):
+        result, client = _call(
+            "create_collection",
+            {"name": "../../admin/mcp/toggle?enabled=false"},
+            responses={},
+        )
+        self.assertTrue(result["isError"])
+        # No HTTP call must be made at all.
+        self.assertEqual(client.calls, [])
+        self.assertIn("Collection name", result["content"][0]["text"])
+
+    def test_delete_rejects_traversal_payload_without_request(self):
+        result, client = _call(
+            "delete_collection",
+            {"name": "../../admin/api-keys/victim"},
+            responses={},
+        )
+        self.assertTrue(result["isError"])
+        self.assertEqual(client.calls, [])
+
+    def test_rejects_empty_name(self):
+        for tool in ("create_collection", "delete_collection"):
+            with self.subTest(tool=tool):
+                result, client = _call(tool, {"name": ""}, responses={})
+                self.assertTrue(result["isError"])
+                self.assertEqual(client.calls, [])
+
+    def test_rejects_overlong_name(self):
+        result, client = _call(
+            "create_collection",
+            {"name": "a" * 65},
+            responses={},
+        )
+        self.assertTrue(result["isError"])
+        self.assertEqual(client.calls, [])
+
+    def test_rejects_disallowed_chars(self):
+        for bad in ("a/b", "a b", "a.b", "a:b", "a%2fb"):
+            with self.subTest(bad=bad):
+                result, client = _call(
+                    "create_collection", {"name": bad}, responses={},
+                )
+                self.assertTrue(result["isError"])
+                self.assertEqual(client.calls, [])
 
 
 class ToolsListTests(unittest.TestCase):
