@@ -28,8 +28,23 @@ CONFIG_DIR = os.environ.get("CONFIG_DIR", "/app/data/config")
 CONFIG_FILE = Path(CONFIG_DIR) / "server_config.json"
 
 # Server-issued credential for backend calls (spec forbids forwarding client tokens).
-# Set MCP_BACKEND_KEY to a dedicated admin key created for the MCP service.
+# Prefer an explicit MCP_BACKEND_KEY env var; otherwise fall back to the
+# auto-provisioned service key the backend writes to the shared config volume.
 MCP_BACKEND_KEY = os.environ.get("MCP_BACKEND_KEY", "")
+SERVICE_KEY_FILE = Path(CONFIG_DIR) / "mcp_service.key"
+
+
+def _backend_headers() -> dict:
+    """Build the Authorization header for backend calls. Reads the auto-provisioned
+    service key fresh so backend key rotation/regeneration is picked up."""
+    key = MCP_BACKEND_KEY
+    if not key:
+        try:
+            if SERVICE_KEY_FILE.exists():
+                key = SERVICE_KEY_FILE.read_text().strip()
+        except Exception:
+            key = ""
+    return {"Authorization": f"Bearer {key}"} if key else {}
 
 CORS_ORIGINS = [o.strip() for o in os.environ.get("CORS_ALLOWED_ORIGINS", "http://192.168.1.52:8902,http://localhost:8902,https://192.168.1.52:8943,https://localhost:8943").split(",") if o.strip()]
 ALLOWED_HOSTS = {h.strip() for h in os.environ.get("ALLOWED_HOSTS", "192.168.1.52:8901,192.168.1.52:8902,192.168.1.52:8943,localhost:8901,localhost:8902,localhost:8943,mcp-server:8001").split(",") if h.strip()}
@@ -198,7 +213,7 @@ async def handle_tool_call(name: str, arguments: dict, caller_is_admin: bool) ->
     if name in ADMIN_TOOLS and not caller_is_admin:
         return {"content": [{"type": "text", "text": "Permission denied: admin API key required"}], "isError": True}
     # Use the MCP server's own credential — never forward the client's token.
-    headers = {"Authorization": f"Bearer {MCP_BACKEND_KEY}"} if MCP_BACKEND_KEY else {}
+    headers = _backend_headers()
     async with httpx.AsyncClient(base_url=BACKEND_URL, timeout=60.0, headers=headers) as client:
         if name == "search_documents":
             resp = await client.post("/api/documents/query", json={
@@ -407,7 +422,7 @@ def handle_jsonrpc(request_body: dict) -> dict | None:
 
 async def _handle_async_jsonrpc(result: dict, caller_is_admin: bool) -> dict:
     """Handle async JSON-RPC calls (tools, resources, prompts)."""
-    headers = {"Authorization": f"Bearer {MCP_BACKEND_KEY}"} if MCP_BACKEND_KEY else {}
+    headers = _backend_headers()
     async with httpx.AsyncClient(base_url=BACKEND_URL, timeout=60.0, headers=headers) as client:
         if result.get("_async_tool_call"):
             params = result["params"]

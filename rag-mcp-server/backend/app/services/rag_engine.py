@@ -340,43 +340,25 @@ def _reciprocal_rank_fusion(
     return [{**docs[did], "score": round(scores[did], 4)} for did in ranked]
 
 
-ENABLE_HYDE = os.environ.get("ENABLE_HYDE", "1") == "1"
+# HyDE is opt-in: it only helps when a local LLM (Ollama) is reachable, so it
+# defaults off and should be enabled (ENABLE_HYDE=1) on GPU deployments.
+ENABLE_HYDE = os.environ.get("ENABLE_HYDE", "0") == "1"
 
-
-async def _hyde_expand(query_text: str) -> str | None:
-    """Generate a hypothetical answer to use as the search embedding (HyDE technique)."""
-    if not ENABLE_HYDE:
-        return None
-    try:
-        from app.services.llm import LLM_URL, LLM_MODEL
-        import httpx
-        resp = httpx.post(
-            f"{LLM_URL}/v1/chat/completions",
-            json={
-                "model": LLM_MODEL,
-                "messages": [
-                    {"role": "system", "content": "Write a short factual paragraph that would answer this question. Do not say 'I don't know'. Just write the answer as if you know it."},
-                    {"role": "user", "content": query_text},
-                ],
-                "temperature": 0.0,
-                "max_tokens": 200,
-            },
-            timeout=15.0,
-        )
-        if resp.status_code == 200:
-            answer = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")
-            if answer:
-                logger.info("HyDE expansion generated (%d chars)", len(answer))
-                return answer
-    except Exception:
-        pass
-    return None
+# Circuit breaker: if the LLM is unreachable, stop attempting HyDE for a while
+# so a dead Ollama can't add latency to every query.
+_HYDE_TIMEOUT = float(os.environ.get("HYDE_TIMEOUT", "8"))
+_HYDE_COOLDOWN = 300.0  # seconds to skip HyDE after a failure
+_hyde_unavailable_until = 0.0
 
 
 def _hyde_expand_sync(query_text: str) -> str | None:
-    """Synchronous wrapper for HyDE — used in the sync query() function."""
+    """Generate a hypothetical answer to use as the search embedding (HyDE technique).
+    Synchronous; runs inside the threadpool via asyncio.to_thread in the router."""
+    global _hyde_unavailable_until
     if not ENABLE_HYDE:
         return None
+    if time.monotonic() < _hyde_unavailable_until:
+        return None  # circuit open — skip until cooldown elapses
     try:
         from app.services.llm import LLM_URL, LLM_MODEL
         import httpx
@@ -391,14 +373,16 @@ def _hyde_expand_sync(query_text: str) -> str | None:
                 "temperature": 0.0,
                 "max_tokens": 200,
             },
-            timeout=15.0,
+            timeout=_HYDE_TIMEOUT,
         )
         if resp.status_code == 200:
             answer = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")
             if answer:
                 return answer
     except Exception:
-        pass
+        # LLM unreachable — open the circuit so we stop trying for a while
+        _hyde_unavailable_until = time.monotonic() + _HYDE_COOLDOWN
+        logger.info("HyDE LLM unreachable; disabling HyDE for %ds", int(_HYDE_COOLDOWN))
     return None
 
 

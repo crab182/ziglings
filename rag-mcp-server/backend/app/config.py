@@ -56,8 +56,11 @@ def load_config() -> dict:
 
 
 def save_config(config: dict):
+    """Atomic write: write to a temp file then os.replace so readers never see a torn file."""
     _ensure_config()
-    CONFIG_FILE.write_text(json.dumps(config, indent=2))
+    tmp = CONFIG_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(config, indent=2))
+    os.replace(tmp, CONFIG_FILE)
 
 
 def atomic_update(fn):

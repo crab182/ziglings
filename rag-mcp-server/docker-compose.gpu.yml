@@ -20,6 +20,7 @@ services:
       - EMBEDDING_DEVICE=cuda
       - LLM_URL=http://ollama:11434
       - LLM_MODEL=${LLM_MODEL:-qwen2.5:14b}
+      - ENABLE_HYDE=1   # local LLM is present on GPU deploys, so HyDE is worthwhile
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     deploy:

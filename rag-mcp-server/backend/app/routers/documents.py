@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from pathlib import Path
 
@@ -56,7 +57,11 @@ async def upload_document(
 
 @router.post("/query")
 async def query_documents(req: QueryRequest, _: dict = Depends(require_api_key)):
-    results = rag_engine.query(req.query, collection_name=req.collection, n_results=req.n_results)
+    # query() is CPU-bound (embedding/BM25/rerank) and may do a network call
+    # for HyDE — run it off the event loop so SSE/MCP stay responsive.
+    results = await asyncio.to_thread(
+        rag_engine.query, req.query, collection_name=req.collection, n_results=req.n_results
+    )
     return {"results": results, "query": req.query}
 
 
@@ -180,7 +185,9 @@ async def ingest_text(req: IngestTextRequest, _: dict = Depends(require_admin_ke
 async def ask_documents(req: QueryRequest, _: dict = Depends(require_api_key)):
     """Search + generate an answer using a local LLM (Ollama). Falls back to search-only."""
     validate_collection_name(req.collection)
-    results = rag_engine.query(req.query, collection_name=req.collection, n_results=req.n_results)
+    results = await asyncio.to_thread(
+        rag_engine.query, req.query, collection_name=req.collection, n_results=req.n_results
+    )
 
     try:
         from app.services.llm import generate_answer

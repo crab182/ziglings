@@ -48,6 +48,15 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error("CONFIG DIR NOT WRITABLE: %s — %s", config_dir, e)
 
+    # Provision the internal MCP service key so the MCP server can authenticate
+    # to the backend out of the box (no manual MCP_BACKEND_KEY setup needed).
+    try:
+        from app.services.auth import ensure_service_key
+        ensure_service_key()
+        logger.info("MCP service key ensured")
+    except Exception as e:
+        logger.warning("Could not provision MCP service key: %s", e)
+
     try:
         from app.services.scheduler import start_scheduler
         start_scheduler()

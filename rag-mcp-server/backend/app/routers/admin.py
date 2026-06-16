@@ -29,7 +29,10 @@ async def get_status(_: dict = Depends(require_api_key)):
         "mcp_enabled": config.get("mcp_enabled", True),
         "total_documents": total_docs,
         "collections": collection_names,
-        "api_keys_count": len([k for k in config.get("api_keys", []) if k.get("active", True)]),
+        "api_keys_count": len([
+            k for k in config.get("api_keys", [])
+            if k.get("active", True) and k.get("name") != auth.SERVICE_KEY_NAME
+        ]),
     }
 
 
@@ -93,7 +96,10 @@ async def get_config(_: dict = Depends(require_admin_key)):
             "active": k.get("active", True),
         }
         for k in config.get("api_keys", [])
+        if k.get("name") != auth.SERVICE_KEY_NAME
     ]
+    # Never expose internal key-management state
+    safe_config.pop("content_hashes", None)
     if "smb_shares" in safe_config:
         safe_config["smb_shares"] = [
             {k: v for k, v in s.items() if k not in ("password", "encrypted_password")}

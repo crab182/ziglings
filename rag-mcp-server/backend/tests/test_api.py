@@ -239,6 +239,17 @@ def run():
     check("path-traversal filename handled", r.status_code in (200, 400),
           f"{r.status_code}: {r.text[:150]}")
 
+    # Internal MCP service key: auto-provisioned, excluded from UX, protected
+    from app.services import auth
+    svc_raw = auth.ensure_service_key()
+    check("service key provisioned", svc_raw.startswith("rmcp_"))
+    check("service key validates as admin",
+          (auth.validate_api_key(svc_raw) or {}).get("is_admin") is True)
+    check("service key hidden from list",
+          all(k["name"] != auth.SERVICE_KEY_NAME for k in auth.list_api_keys()))
+    check("service key not deletable", auth.delete_api_key(auth.SERVICE_KEY_NAME) is False)
+    check("ensure_service_key idempotent", auth.ensure_service_key() == svc_raw)
+
     print("\n" + "=" * 50)
     print(f"RESULT: {len(_failures)} failure(s)")
     for n, d in _failures:
