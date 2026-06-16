@@ -340,6 +340,68 @@ def _reciprocal_rank_fusion(
     return [{**docs[did], "score": round(scores[did], 4)} for did in ranked]
 
 
+ENABLE_HYDE = os.environ.get("ENABLE_HYDE", "1") == "1"
+
+
+async def _hyde_expand(query_text: str) -> str | None:
+    """Generate a hypothetical answer to use as the search embedding (HyDE technique)."""
+    if not ENABLE_HYDE:
+        return None
+    try:
+        from app.services.llm import LLM_URL, LLM_MODEL
+        import httpx
+        resp = httpx.post(
+            f"{LLM_URL}/v1/chat/completions",
+            json={
+                "model": LLM_MODEL,
+                "messages": [
+                    {"role": "system", "content": "Write a short factual paragraph that would answer this question. Do not say 'I don't know'. Just write the answer as if you know it."},
+                    {"role": "user", "content": query_text},
+                ],
+                "temperature": 0.0,
+                "max_tokens": 200,
+            },
+            timeout=15.0,
+        )
+        if resp.status_code == 200:
+            answer = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+            if answer:
+                logger.info("HyDE expansion generated (%d chars)", len(answer))
+                return answer
+    except Exception:
+        pass
+    return None
+
+
+def _hyde_expand_sync(query_text: str) -> str | None:
+    """Synchronous wrapper for HyDE — used in the sync query() function."""
+    if not ENABLE_HYDE:
+        return None
+    try:
+        from app.services.llm import LLM_URL, LLM_MODEL
+        import httpx
+        resp = httpx.post(
+            f"{LLM_URL}/v1/chat/completions",
+            json={
+                "model": LLM_MODEL,
+                "messages": [
+                    {"role": "system", "content": "Write a short factual paragraph that would answer this question. Do not say 'I don't know'. Just write the answer as if you know it."},
+                    {"role": "user", "content": query_text},
+                ],
+                "temperature": 0.0,
+                "max_tokens": 200,
+            },
+            timeout=15.0,
+        )
+        if resp.status_code == 200:
+            answer = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+            if answer:
+                return answer
+    except Exception:
+        pass
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Query (vector + BM25 + rerank + sanitize + observability)
 # ---------------------------------------------------------------------------
@@ -356,8 +418,12 @@ def query(query_text: str, collection_name: str = "default", n_results: int = 5)
     if collection.count() == 0:
         return []
 
+    # HyDE: embed a hypothetical answer instead of the raw query (when LLM is available)
+    hyde_text = _hyde_expand_sync(query_text)
+    embed_text = hyde_text if hyde_text else query_text
+
     fetch_n = min(max(n_results * 5, 30), collection.count())
-    query_embedding = model.encode([query_text]).tolist()
+    query_embedding = model.encode([embed_text]).tolist()
     results = collection.query(
         query_embeddings=query_embedding,
         n_results=fetch_n,

@@ -15,6 +15,22 @@
   --radius: 8px;
 }
 
+body.light {
+  --bg-primary: #f8fafc;
+  --bg-secondary: #ffffff;
+  --bg-card: #ffffff;
+  --bg-input: #f1f5f9;
+  --text-primary: #0f172a;
+  --text-secondary: #475569;
+  --text-muted: #94a3b8;
+  --accent: #2563eb;
+  --accent-hover: #1d4ed8;
+  --success: #16a34a;
+  --warning: #d97706;
+  --danger: #dc2626;
+  --border: #e2e8f0;
+}
+
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
 body {
@@ -542,3 +558,56 @@ body {
   color: var(--accent);
   font-size: 0.8rem;
 }
+
+/* Citation badges */
+.citation-badge {
+  display: inline-block;
+  background: var(--bg-input);
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.15rem 0.4rem;
+  font-size: 0.75rem;
+  margin-left: 0.3rem;
+  cursor: default;
+}
+
+.citation-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  margin-top: 0.5rem;
+}
+
+.citation-list .citation-badge:hover {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+
+/* Answer block */
+.answer-block {
+  background: var(--bg-input);
+  border-left: 3px solid var(--accent);
+  padding: 1rem;
+  border-radius: 0 var(--radius) var(--radius) 0;
+  line-height: 1.7;
+}
+
+/* Metrics display */
+.metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 0.75rem;
+  margin-top: 0.5rem;
+}
+
+.metric-item {
+  background: var(--bg-input);
+  border-radius: var(--radius);
+  padding: 0.6rem;
+  text-align: center;
+}
+
+.metric-item .label { font-size: 0.75rem; color: var(--text-muted); }
+.metric-item .value { font-size: 1.1rem; font-weight: 600; }

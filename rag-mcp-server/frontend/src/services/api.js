@@ -112,6 +112,14 @@ export const disableSync = (name) =>
 export const triggerSync = (name) =>
   request(`/smb/saved/${encodeURIComponent(name)}/sync/trigger`, { method: 'POST' });
 
+export const askDocuments = (query, collection = 'default', n_results = 5) =>
+  request('/documents/ask', {
+    method: 'POST',
+    body: JSON.stringify({ query, collection, n_results }),
+  });
+
+export const getMetrics = () => request('/admin/metrics');
+
 // Admin
 export const getStatus = () => request('/admin/status');
 export const createAPIKey = (name, description = '', is_admin = false) =>
