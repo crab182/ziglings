@@ -33,7 +33,7 @@ export default function Dashboard() {
         </div>
         <div className="stat-card">
           <div className="label">Active API Keys</div>
-          <div className="value">{status.api_keys_count}</div>
+          <div className="value">{status.active_credentials}</div>
         </div>
         <div className="stat-card">
           <div className="label">MCP Server</div>

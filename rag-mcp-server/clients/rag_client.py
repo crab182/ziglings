@@ -79,7 +79,7 @@ def cmd_status(args):
         # Cast scalars to break any CodeQL taint flow; this endpoint returns
         # only counts/names — never secrets.
         doc_count = int(s.get("total_documents", 0))
-        active_count = int(s.get("api_keys_count", 0))
+        active_count = int(s.get("active_credentials", 0))
         collections = ", ".join(s.get("collections", [])) or " none"
         print(f"Server:      {s['hostname']} ({s['ip']})")
         print(f"MCP:         {'enabled' if s['mcp_enabled'] else 'disabled'}")

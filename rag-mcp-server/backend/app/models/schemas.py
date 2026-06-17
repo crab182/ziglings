@@ -119,7 +119,7 @@ class ServerStatus(BaseModel):
     mcp_enabled: bool
     total_documents: int
     collections: list[str]
-    api_keys_count: int
+    active_credentials: int
 
 
 class SavedShareCreate(BaseModel):

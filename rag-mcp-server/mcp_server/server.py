@@ -278,7 +278,7 @@ async def handle_tool_call(name: str, arguments: dict, caller_is_admin: bool) ->
                 f"**MCP Enabled:** {data['mcp_enabled']}\n"
                 f"**Total Documents:** {data['total_documents']}\n"
                 f"**Collections:** {', '.join(data['collections']) or 'none'}\n"
-                f"**Active API Keys:** {data['api_keys_count']}"
+                f"**Active API Keys:** {data['active_credentials']}"
             )
             return {
                 "content": [

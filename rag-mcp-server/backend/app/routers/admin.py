@@ -29,7 +29,7 @@ async def get_status(_: dict = Depends(require_api_key)):
         "mcp_enabled": config.get("mcp_enabled", True),
         "total_documents": total_docs,
         "collections": collection_names,
-        "api_keys_count": len([
+        "active_credentials": len([
             k for k in config.get("api_keys", [])
             if k.get("active", True) and k.get("name") != auth.SERVICE_KEY_NAME
         ]),
