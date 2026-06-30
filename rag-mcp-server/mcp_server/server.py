@@ -176,49 +176,51 @@ TOOLS = [
         },
     },
     {
-        "name": "create_collection",
-        "description": "Create a new document collection. Requires an admin-tier API key. Name must be 1-64 characters of letters, digits, '_', or '-'.",
+        "name": "list_agents",
+        "description": "List all deployed AI agents on the server with their current status, type, and last heartbeat time.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_agent_status",
+        "description": "Get detailed status of a specific agent including recent tasks and health information.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "Collection name (1-64 chars, [A-Za-z0-9_-])"},
+                "agent_id": {"type": "string", "description": "The agent identifier (e.g., 'doc-summarizer', 'task-runner')"},
             },
-            "required": ["name"],
+            "required": ["agent_id"],
         },
     },
     {
-        "name": "delete_collection",
-        "description": "Delete a document collection and all of its embeddings. Requires an admin-tier API key. The 'default' collection cannot be deleted.",
+        "name": "submit_agent_task",
+        "description": "Submit a task to a specific agent for execution. The task-runner agent accepts arbitrary tasks processed by Claude. Requires an admin-tier API key.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "Collection name to delete"},
+                "agent_id": {"type": "string", "description": "Target agent identifier"},
+                "description": {"type": "string", "description": "Human-readable task description"},
+                "task_type": {"type": "string", "description": "Task type: 'shell', 'api_call', or 'query'", "default": "query"},
+                "payload": {"type": "object", "description": "Task-specific parameters", "default": {}},
             },
-            "required": ["name"],
+            "required": ["agent_id", "description"],
+        },
+    },
+    {
+        "name": "get_agent_tasks",
+        "description": "Get recent tasks for a specific agent with their status and results.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "agent_id": {"type": "string", "description": "The agent identifier"},
+                "limit": {"type": "integer", "description": "Number of recent tasks to return (default: 10)", "default": 10},
+            },
+            "required": ["agent_id"],
         },
     },
 ]
 
 
-ADMIN_TOOLS = {"ingest_note", "create_collection", "delete_collection"}
-
-# Mirror of backend's COLLECTION_NAME_RE (services/security.py). The MCP
-# server uses MCP_BACKEND_KEY (admin) for backend calls, so an unvalidated
-# `name` interpolated into a request path can be exploited: httpx normalizes
-# `..` segments per RFC 3986, so e.g. `name="../../admin/api-keys/victim"`
-# would resolve to a backend admin endpoint before the backend's own
-# validator can reject it. We refuse the call before any request goes out.
-_COLLECTION_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
-
-
-def _reject_bad_name(name: str) -> dict | None:
-    if not _COLLECTION_NAME_RE.match(name or ""):
-        return {
-            "content": [{"type": "text", "text":
-                "Collection name must be 1-64 chars: letters, digits, '_' or '-'"}],
-            "isError": True,
-        }
-    return None
+ADMIN_TOOLS = {"ingest_note", "submit_agent_task", "get_agent_tasks"}
 
 
 async def handle_tool_call(name: str, arguments: dict, caller_is_admin: bool) -> dict:

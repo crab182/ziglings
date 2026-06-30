@@ -5,6 +5,7 @@ import Search from './pages/Search'
 import SMBBrowser from './pages/SMBBrowser'
 import MCPConfig from './pages/MCPConfig'
 import APIKeys from './pages/APIKeys'
+import Devices from './pages/Devices'
 import {
   checkBootstrap,
   createAPIKey,
@@ -20,6 +21,7 @@ const PAGES = [
   { id: 'search', label: 'Search', icon: '?' },
   { id: 'smb', label: 'SMB Browser', icon: '>' },
   { id: 'mcp', label: 'MCP Server', icon: '*' },
+  { id: 'devices', label: 'Devices', icon: '@' },
   { id: 'apikeys', label: 'API Keys', icon: 'K' },
 ]
 
@@ -29,6 +31,7 @@ const PAGE_COMPONENTS = {
   search: Search,
   smb: SMBBrowser,
   mcp: MCPConfig,
+  devices: Devices,
   apikeys: APIKeys,
 }
 

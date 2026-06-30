@@ -12,7 +12,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from app.routers import admin, documents, smb
+from app.routers import admin, agents, documents, smb
 from app.services.security import require_admin_key
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
@@ -108,6 +108,7 @@ async def _unhandled(request: Request, exc: Exception):
 app.include_router(documents.router)
 app.include_router(smb.router)
 app.include_router(admin.router)
+app.include_router(agents.router)
 
 
 @app.get("/health")
