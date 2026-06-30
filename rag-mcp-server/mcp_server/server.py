@@ -10,6 +10,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import uuid
 from pathlib import Path
 from typing import AsyncGenerator
@@ -330,78 +331,57 @@ async def handle_tool_call(name: str, arguments: dict, caller_is_admin: bool) ->
             text = f"Ingested **{data['source']}** into collection **{data['collection']}**: {data['chunks_created']} chunks created."
             return {"content": [{"type": "text", "text": text}], "isError": False}
 
-        elif name == "list_agents":
-            resp = await client.get("/api/agents/list")
+        elif name == "create_collection":
+            coll_name = arguments.get("name", "")
+            bad = _reject_bad_name(coll_name)
+            if bad:
+                return bad
+            resp = await client.post(f"/api/documents/collections/{coll_name}")
+            if resp.status_code == 400:
+                detail = _detail(resp)
+                return {"content": [{"type": "text", "text": f"Invalid collection name: {detail}"}], "isError": True}
             resp.raise_for_status()
-            agents = resp.json().get("agents", [])
-            if not agents:
-                text = "No agents currently registered."
-            else:
-                lines = []
-                for a in agents:
-                    status_icon = "running" if a["status"] == "running" else a["status"]
-                    lines.append(
-                        f"- **{a['agent_id']}** ({a['agent_type']}) - {status_icon} | "
-                        f"tasks: {a.get('tasks_completed', 0)} | heartbeat: {a.get('last_heartbeat', 'never')}"
-                    )
-                text = "\n".join(lines)
-            return {"content": [{"type": "text", "text": text}], "isError": False}
+            data = resp.json()
+            text = f"Created collection **{data['name']}**."
+            return {
+                "content": [
+                    {"type": "text", "text": text},
+                    {"type": "text", "text": json.dumps(data)},
+                ],
+                "isError": False,
+            }
 
-        elif name == "get_agent_status":
-            agent_id = arguments.get("agent_id", "")
-            resp = await client.get(f"/api/agents/{agent_id}/status")
+        elif name == "delete_collection":
+            coll_name = arguments.get("name", "")
+            bad = _reject_bad_name(coll_name)
+            if bad:
+                return bad
+            resp = await client.delete(f"/api/documents/collections/{coll_name}")
+            if resp.status_code == 400:
+                # Backend rejects "default" with 400 and surfaces a detail message —
+                # propagate it so the LLM can explain the constraint to the user.
+                detail = _detail(resp)
+                return {"content": [{"type": "text", "text": detail}], "isError": True}
             resp.raise_for_status()
-            a = resp.json()
-            text = (
-                f"**Agent:** {a['agent_id']}\n"
-                f"**Type:** {a['agent_type']}\n"
-                f"**Status:** {a.get('status', 'unknown')}\n"
-                f"**Container:** {a.get('container_name', '')}\n"
-                f"**Registered:** {a.get('registered_at', '')}\n"
-                f"**Last Heartbeat:** {a.get('last_heartbeat', '')}\n"
-                f"**Tasks Completed:** {a.get('tasks_completed', 0)}\n"
-            )
-            # Task bodies are admin-only; the backend redacts them for non-admin
-            # callers, and we additionally gate here since the MCP service calls
-            # the backend with its own admin credential.
-            recent = a.get("recent_tasks", []) if caller_is_admin else []
-            if recent:
-                text += "\n**Recent Tasks:**\n"
-                for t in recent:
-                    text += f"- [{t['status']}] {t['description'][:80]} (id: {t['task_id']})\n"
-            return {"content": [{"type": "text", "text": text}], "isError": False}
-
-        elif name == "submit_agent_task":
-            agent_id = arguments.get("agent_id", "")
-            resp = await client.post(f"/api/agents/{agent_id}/tasks", json={
-                "description": arguments.get("description", ""),
-                "task_type": arguments.get("task_type", "query"),
-                "payload": arguments.get("payload", {}),
-            })
-            resp.raise_for_status()
-            task = resp.json()
-            text = f"Task submitted to **{agent_id}**\n- Task ID: `{task['task_id']}`\n- Status: {task['status']}"
-            return {"content": [{"type": "text", "text": text}], "isError": False}
-
-        elif name == "get_agent_tasks":
-            agent_id = arguments.get("agent_id", "")
-            limit = min(max(int(arguments.get("limit", 10)), 1), 100)
-            resp = await client.get(f"/api/agents/{agent_id}/tasks", params={"limit": limit})
-            resp.raise_for_status()
-            tasks = resp.json().get("tasks", [])
-            if not tasks:
-                text = f"No tasks found for agent **{agent_id}**."
-            else:
-                lines = [f"**Tasks for {agent_id}:**"]
-                for t in tasks:
-                    result_preview = ""
-                    if t.get("result"):
-                        result_preview = f" | result: {t['result'][:100]}..."
-                    lines.append(f"- `{t['task_id']}` [{t['status']}] {t['description'][:60]}{result_preview}")
-                text = "\n".join(lines)
-            return {"content": [{"type": "text", "text": text}], "isError": False}
+            data = resp.json()
+            text = f"Deleted collection **{data['name']}**."
+            return {
+                "content": [
+                    {"type": "text", "text": text},
+                    {"type": "text", "text": json.dumps(data)},
+                ],
+                "isError": False,
+            }
 
         return {"content": [{"type": "text", "text": f"Unknown tool: {name}"}], "isError": True}
+
+
+def _detail(resp) -> str:
+    """Extract FastAPI's {'detail': ...} message, falling back to status text."""
+    try:
+        return str(resp.json().get("detail", resp.text))
+    except Exception:
+        return resp.text or f"HTTP {resp.status_code}"
 
 
 def handle_jsonrpc(request_body: dict) -> dict | None:
