@@ -43,8 +43,12 @@ services:
     restart: unless-stopped
     # Serve, then pull the model in the background (idempotent — a no-op once cached).
     entrypoint: ["/bin/sh", "-c", "ollama serve & sleep 5; ollama pull ${LLM_MODEL:-qwen2.5:14b}; wait"]
-    ports:
-      - "11434:11434"
+    # Ollama has NO authentication. The backend reaches it over the internal
+    # compose network, so no host port is needed. Uncomment only if other LAN
+    # apps must use this Ollama directly — anyone on the LAN could then run
+    # prompts or delete/pull models.
+    # ports:
+    #   - "11434:11434"
     volumes:
       - ./data/ollama:/root/.ollama
     environment:

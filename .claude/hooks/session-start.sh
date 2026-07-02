@@ -25,9 +25,11 @@ pip install --quiet \
   APScheduler==3.10.4 \
   rank-bm25==0.2.2
 
-# Frontend deps (for vite build / bracket checks)
+# Frontend deps (for vite build / bracket checks).
+# --ignore-scripts blocks dependency lifecycle scripts from executing during
+# install (supply-chain hardening; vite/react don't need install scripts).
 if [ -d "$CLAUDE_PROJECT_DIR/rag-mcp-server/frontend" ]; then
-  (cd "$CLAUDE_PROJECT_DIR/rag-mcp-server/frontend" && npm install --no-audit --no-fund --silent) || \
+  (cd "$CLAUDE_PROJECT_DIR/rag-mcp-server/frontend" && npm install --ignore-scripts --no-audit --no-fund --silent) || \
     echo "[session-start] npm install failed (non-fatal)"
 fi
 
