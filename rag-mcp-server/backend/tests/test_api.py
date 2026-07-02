@@ -274,6 +274,38 @@ def run():
           "[1]" in msgs[0]["content"] and "context blocks" in msgs[0]["content"].lower(),
           msgs[0]["content"][:120])
 
+    # Contextual retrieval at ingest (opt-in via ENABLE_CONTEXTUAL_INGEST).
+    # Capture what gets stored by wrapping the stub collection's upsert.
+    from app.services import rag_engine as _re
+    _captured = {}
+    _col = _re.get_or_create_collection("ctxtest")
+    _orig_upsert = _col.upsert
+    _orig_ctx = _re._contextualize_sync
+    _col.upsert = lambda **kw: _captured.update(documents=kw.get("documents"))
+    try:
+        # (a) default OFF: the stored chunk is not contextualized, no LLM call.
+        n_off = _re.ingest_text("plain device manual content one",
+                                source="ctx_off", collection_name="ctxtest")
+        off_docs = _captured.get("documents") or []
+        check("contextual default-off leaves chunk unchanged",
+              n_off == len(off_docs) and bool(off_docs) and not off_docs[0].startswith("[Context:"),
+              str(off_docs)[:120])
+
+        # (b) enabled + stubbed contextualizer: stored chunk is prepended.
+        _captured.clear()
+        _re._contextualize_sync = lambda source, section, chunk_text: "[Context: X]\n" + chunk_text
+        _re.ENABLE_CONTEXTUAL_INGEST = True
+        _re.ingest_text("plain device manual content two",
+                        source="ctx_on", collection_name="ctxtest")
+        on_docs = _captured.get("documents") or []
+        check("contextual ingest prepends [Context:] to stored chunk",
+              bool(on_docs) and on_docs[0].startswith("[Context:"),
+              str(on_docs)[:120])
+    finally:
+        _re.ENABLE_CONTEXTUAL_INGEST = False
+        _re._contextualize_sync = _orig_ctx
+        _col.upsert = _orig_upsert
+
     print("\n" + "=" * 50)
     print(f"RESULT: {len(_failures)} failure(s)")
     for n, d in _failures:

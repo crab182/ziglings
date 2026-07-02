@@ -234,26 +234,38 @@ def _remove_content_hash(source: str, collection_name: str):
     atomic_update(_update)
 
 
-# Contextual retrieval (opt-in): an LLM writes a 1-2 sentence situating context
-# per chunk, prepended before embedding. Big retrieval win, slow ingest, needs Ollama.
+# Contextual retrieval (opt-in): before embedding each chunk, a local LLM writes a
+# short situating sentence that is prepended to the chunk and used for BOTH the
+# embedding and the stored document. Big retrieval win, but it makes ingestion much
+# slower and needs Ollama, so it defaults OFF.
 ENABLE_CONTEXTUAL_INGEST = os.environ.get("ENABLE_CONTEXTUAL_INGEST", "0") == "1"
-_CTX_TIMEOUT = float(os.environ.get("CONTEXTUAL_TIMEOUT", "20"))
+
+# Circuit breaker mirroring HyDE: if Ollama is unreachable, stop attempting
+# contextualization for a while so a dead LLM can't stall every ingest.
+_CTX_TIMEOUT = float(os.environ.get("CONTEXTUAL_TIMEOUT", "8"))
+_CTX_COOLDOWN = 300.0  # seconds to skip contextualization after a failure
 _ctx_unavailable_until = 0.0
 
 
-def _contextualize_chunk(doc_summary: str, source: str, chunk: str) -> str:
-    """Return a short context sentence for a chunk, or '' if LLM unavailable."""
+def _contextualize_sync(source: str, section: str, chunk_text: str) -> str:
+    """Prepend a 1-sentence LLM-written situating context to a chunk.
+
+    Returns ``"[Context: <ctx>]\\n" + chunk_text`` on success, or ``chunk_text``
+    unchanged if the circuit breaker is open or the LLM is unreachable. Synchronous
+    so it can run inside the ingest threadpool; uses an 8s httpx timeout.
+    """
     global _ctx_unavailable_until
     if time.monotonic() < _ctx_unavailable_until:
-        return ""
+        return chunk_text  # circuit open — skip until cooldown elapses
     try:
         from app.services.llm import LLM_URL, LLM_MODEL
         import httpx
+        section_line = f"Section: {section}\n" if section else ""
         prompt = (
-            f"Document: {source}\nDocument overview:\n{doc_summary[:1500]}\n\n"
-            f"Chunk:\n{chunk[:1500]}\n\n"
-            "Give a 1-2 sentence context situating this chunk within the document, "
-            "to improve search retrieval. Answer with only the context sentence(s)."
+            f"Document: {source}\n{section_line}"
+            f"Chunk:\n{chunk_text[:1500]}\n\n"
+            "Write ONE short sentence situating this chunk within the document, "
+            "to improve search retrieval. Answer with only that sentence."
         )
         resp = httpx.post(
             f"{LLM_URL}/v1/chat/completions",
@@ -263,11 +275,14 @@ def _contextualize_chunk(doc_summary: str, source: str, chunk: str) -> str:
             timeout=_CTX_TIMEOUT,
         )
         if resp.status_code == 200:
-            return resp.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            ctx = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            if ctx:
+                return f"[Context: {ctx}]\n{chunk_text}"
     except Exception:
-        _ctx_unavailable_until = time.monotonic() + 300.0
-        logger.info("Contextual ingest LLM unreachable; disabling for 300s")
-    return ""
+        # LLM unreachable — open the circuit so ingestion doesn't stall
+        _ctx_unavailable_until = time.monotonic() + _CTX_COOLDOWN
+        logger.info("Contextual ingest LLM unreachable; disabling for %ds", int(_CTX_COOLDOWN))
+    return chunk_text
 
 
 def ingest_text(text: str, source: str, collection_name: str = "default", metadata: dict | None = None):
@@ -293,18 +308,17 @@ def ingest_text(text: str, source: str, collection_name: str = "default", metada
     if not chunk_texts:
         return 0
 
+    # Contextual retrieval (opt-in): prepend an LLM-written situating sentence to
+    # each chunk, then embed AND store that contextualized text.
+    if ENABLE_CONTEXTUAL_INGEST:
+        chunk_texts = [
+            _contextualize_sync(source, extra_meta[i].get("section_header", ""), ch)
+            for i, ch in enumerate(chunk_texts)
+        ]
+
     ids = [compute_doc_id(source, i) for i in range(len(chunk_texts))]
 
-    # Contextual retrieval: embed (context + chunk) but store the original chunk.
-    embed_texts = chunk_texts
-    if ENABLE_CONTEXTUAL_INGEST:
-        doc_summary = " ".join(text.split()[:400])
-        embed_texts = []
-        for i, ch in enumerate(chunk_texts):
-            ctx = _contextualize_chunk(doc_summary, source, ch)
-            embed_texts.append(f"{ctx}\n{ch}" if ctx else ch)
-
-    embeddings = model.encode(embed_texts).tolist()
+    embeddings = model.encode(chunk_texts).tolist()
     metadatas = []
     for i, em in enumerate(extra_meta):
         m = {**(metadata or {}), "source": source, "chunk_index": i}
