@@ -10,6 +10,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import uuid
 from pathlib import Path
 from typing import AsyncGenerator
@@ -205,12 +206,51 @@ TOOLS = [
                 "n_results": {"type": "integer", "description": "Number of source chunks to use (default: 5)", "default": 5},
             },
             "required": ["query"],
+        "name": "list_agents",
+        "description": "List all deployed AI agents on the server with their current status, type, and last heartbeat time.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_agent_status",
+        "description": "Get detailed status of a specific agent including recent tasks and health information.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "agent_id": {"type": "string", "description": "The agent identifier (e.g., 'doc-summarizer', 'task-runner')"},
+            },
+            "required": ["agent_id"],
+        },
+    },
+    {
+        "name": "submit_agent_task",
+        "description": "Submit a task to a specific agent for execution. The task-runner agent accepts arbitrary tasks processed by Claude. Requires an admin-tier API key.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "agent_id": {"type": "string", "description": "Target agent identifier"},
+                "description": {"type": "string", "description": "Human-readable task description"},
+                "task_type": {"type": "string", "description": "Task type: 'shell', 'api_call', or 'query'", "default": "query"},
+                "payload": {"type": "object", "description": "Task-specific parameters", "default": {}},
+            },
+            "required": ["agent_id", "description"],
+        },
+    },
+    {
+        "name": "get_agent_tasks",
+        "description": "Get recent tasks for a specific agent with their status and results.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "agent_id": {"type": "string", "description": "The agent identifier"},
+                "limit": {"type": "integer", "description": "Number of recent tasks to return (default: 10)", "default": 10},
+            },
+            "required": ["agent_id"],
         },
     },
 ]
 
 
-ADMIN_TOOLS = {"ingest_note"}
+ADMIN_TOOLS = {"ingest_note", "submit_agent_task", "get_agent_tasks"}
 
 
 async def handle_tool_call(name: str, arguments: dict, caller_is_admin: bool) -> dict:
@@ -320,30 +360,57 @@ async def handle_tool_call(name: str, arguments: dict, caller_is_admin: bool) ->
             text = f"Ingested **{data['source']}** into collection **{data['collection']}**: {data['chunks_created']} chunks created."
             return {"content": [{"type": "text", "text": text}], "isError": False}
 
-        elif name == "ask_documents":
-            resp = await client.post("/api/documents/ask", json={
-                "query": arguments.get("query", ""),
-                "collection": arguments.get("collection", "default"),
-                "n_results": min(max(int(arguments.get("n_results", 5)), 1), 50),
-            })
+        elif name == "create_collection":
+            coll_name = arguments.get("name", "")
+            bad = _reject_bad_name(coll_name)
+            if bad:
+                return bad
+            resp = await client.post(f"/api/documents/collections/{coll_name}")
+            if resp.status_code == 400:
+                detail = _detail(resp)
+                return {"content": [{"type": "text", "text": f"Invalid collection name: {detail}"}], "isError": True}
             resp.raise_for_status()
             data = resp.json()
-            parts = []
-            if data.get("answer"):
-                parts.append(f"**Answer** (via {data.get('model', 'LLM')}):\n{data['answer']}")
-            if data.get("sources"):
-                parts.append("**Sources:**")
-                for s in data["sources"]:
-                    cite = f"- {s['source']} (score: {s['score']})"
-                    if s.get("page"):
-                        cite += f" p.{s['page']}"
-                    if s.get("section"):
-                        cite += f" {s['section']}"
-                    parts.append(cite)
-            text = "\n\n".join(parts) if parts else "No results found."
-            return {"content": [{"type": "text", "text": text}], "isError": False}
+            text = f"Created collection **{data['name']}**."
+            return {
+                "content": [
+                    {"type": "text", "text": text},
+                    {"type": "text", "text": json.dumps(data)},
+                ],
+                "isError": False,
+            }
+
+        elif name == "delete_collection":
+            coll_name = arguments.get("name", "")
+            bad = _reject_bad_name(coll_name)
+            if bad:
+                return bad
+            resp = await client.delete(f"/api/documents/collections/{coll_name}")
+            if resp.status_code == 400:
+                # Backend rejects "default" with 400 and surfaces a detail message —
+                # propagate it so the LLM can explain the constraint to the user.
+                detail = _detail(resp)
+                return {"content": [{"type": "text", "text": detail}], "isError": True}
+            resp.raise_for_status()
+            data = resp.json()
+            text = f"Deleted collection **{data['name']}**."
+            return {
+                "content": [
+                    {"type": "text", "text": text},
+                    {"type": "text", "text": json.dumps(data)},
+                ],
+                "isError": False,
+            }
 
         return {"content": [{"type": "text", "text": f"Unknown tool: {name}"}], "isError": True}
+
+
+def _detail(resp) -> str:
+    """Extract FastAPI's {'detail': ...} message, falling back to status text."""
+    try:
+        return str(resp.json().get("detail", resp.text))
+    except Exception:
+        return resp.text or f"HTTP {resp.status_code}"
 
 
 def handle_jsonrpc(request_body: dict) -> dict | None:
