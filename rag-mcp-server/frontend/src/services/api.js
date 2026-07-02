@@ -1,13 +1,14 @@
 const API_BASE = '/api';
-const TOKEN_KEY = 'rmcp_api_key';
 
-export const getToken = () => localStorage.getItem(TOKEN_KEY) || '';
-export const setToken = (token) => {
-  const trimmed = token ? token.trim() : '';
-  if (trimmed) localStorage.setItem(TOKEN_KEY, trimmed);
-  else localStorage.removeItem(TOKEN_KEY);
-};
-export const clearToken = () => localStorage.removeItem(TOKEN_KEY);
+// The admin API key is held in memory for the tab's lifetime only — never
+// written to localStorage/sessionStorage/cookies. This avoids persisting a
+// bearer credential at rest in the browser (CodeQL js/clear-text-storage).
+// Trade-off: the key must be re-entered after a full page reload or new tab.
+let _token = '';
+
+export const getToken = () => _token;
+export const setToken = (token) => { _token = token ? token.trim() : ''; };
+export const clearToken = () => { _token = ''; };
 
 function authHeaders() {
   const token = getToken();
