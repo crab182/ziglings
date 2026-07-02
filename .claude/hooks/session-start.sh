@@ -26,10 +26,15 @@ pip install --quiet \
   rank-bm25==0.2.2
 
 # Frontend deps (for vite build / bracket checks).
-# --ignore-scripts blocks dependency lifecycle scripts from executing during
-# install (supply-chain hardening; vite/react don't need install scripts).
+# - npm ci installs the EXACT versions pinned in the committed
+#   package-lock.json (no dependency drift), falling back to npm install
+#   only if the lockfile is somehow absent.
+# - --ignore-scripts blocks dependency lifecycle scripts from executing
+#   during install (supply-chain hardening; vite/react need no install scripts).
 if [ -d "$CLAUDE_PROJECT_DIR/rag-mcp-server/frontend" ]; then
-  (cd "$CLAUDE_PROJECT_DIR/rag-mcp-server/frontend" && npm install --ignore-scripts --no-audit --no-fund --silent) || \
+  (cd "$CLAUDE_PROJECT_DIR/rag-mcp-server/frontend" \
+    && { npm ci --ignore-scripts --no-audit --no-fund --silent \
+         || npm install --ignore-scripts --no-audit --no-fund --silent; }) || \
     echo "[session-start] npm install failed (non-fatal)"
 fi
 
