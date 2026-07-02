@@ -206,6 +206,9 @@ TOOLS = [
                 "n_results": {"type": "integer", "description": "Number of source chunks to use (default: 5)", "default": 5},
             },
             "required": ["query"],
+        },
+    },
+    {
         "name": "list_agents",
         "description": "List all deployed AI agents on the server with their current status, type, and last heartbeat time.",
         "inputSchema": {"type": "object", "properties": {}},
@@ -247,10 +250,34 @@ TOOLS = [
             "required": ["agent_id"],
         },
     },
+    {
+        "name": "create_collection",
+        "description": "Create a new document collection. Requires an admin-tier API key.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Collection name (1-64 chars: letters, digits, '_' or '-')"},
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "delete_collection",
+        "description": "Delete a document collection and all its indexed chunks. The 'default' collection cannot be deleted. Requires an admin-tier API key.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Collection name to delete"},
+            },
+            "required": ["name"],
+        },
+    },
 ]
 
 
-ADMIN_TOOLS = {"ingest_note", "submit_agent_task", "get_agent_tasks"}
+ADMIN_TOOLS = {"ingest_note", "submit_agent_task", "get_agent_tasks", "create_collection", "delete_collection"}
+
+# Mirrors backend validate_collection_name
 
 
 async def handle_tool_call(name: str, arguments: dict, caller_is_admin: bool) -> dict:
@@ -403,6 +430,26 @@ async def handle_tool_call(name: str, arguments: dict, caller_is_admin: bool) ->
             }
 
         return {"content": [{"type": "text", "text": f"Unknown tool: {name}"}], "isError": True}
+
+
+# Client-side collection-name guard: httpx normalizes `..` path segments, so an
+# unvalidated name interpolated into the URL could redirect a request to a backend
+# admin endpoint (api-keys, mcp/toggle) carrying the server's admin MCP_BACKEND_KEY.
+# Validate before making ANY HTTP call.
+_COLLECTION_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _reject_bad_name(name: str):
+    """Return an isError tool result if the collection name is invalid, else None."""
+    if not _COLLECTION_NAME_RE.match(name or ""):
+        return {
+            "content": [{
+                "type": "text",
+                "text": "Collection name must be 1-64 characters: letters, digits, '_' or '-'.",
+            }],
+            "isError": True,
+        }
+    return None
 
 
 def _detail(resp) -> str:
