@@ -124,6 +124,10 @@ def check_origin(request: Request) -> None:
 
 # --- MCP Protocol Implementation ---
 
+# Cap for document content returned through any MCP path (get_document tool
+# and resources/read) — protects clients from unbounded payloads.
+MAX_DOCUMENT_CHARS = 100_000
+
 SERVER_INFO = {"name": "rag-document-server", "version": "1.0.0"}
 SERVER_CAPABILITIES = {
     "tools": {"listChanged": False},
@@ -297,9 +301,8 @@ async def handle_tool_call(name: str, arguments: dict, caller_is_admin: bool) ->
             resp.raise_for_status()
             data = resp.json()
             content = data.get("content", "")
-            MAX_CHARS = 100_000
-            if len(content) > MAX_CHARS:
-                content = content[:MAX_CHARS] + f"\n\n[Truncated — full document is {len(data['content'])} characters across {data['chunk_count']} chunks]"
+            if len(content) > MAX_DOCUMENT_CHARS:
+                content = content[:MAX_DOCUMENT_CHARS] + f"\n\n[Truncated — full document is {len(data['content'])} characters across {data['chunk_count']} chunks]"
             text = f"**Source:** {data['source']} ({data['chunk_count']} chunks)\n**Collection:** {data['collection']}\n\n{content}"
             return {"content": [{"type": "text", "text": text}], "isError": False}
 
@@ -469,8 +472,16 @@ async def _handle_async_jsonrpc(result: dict, caller_is_admin: bool) -> dict:
                     return {"jsonrpc": "2.0", "id": result["id"], "error": {"code": -32602, "message": "Document not found"}}
                 resp.raise_for_status()
                 data = resp.json()
+                text = data.get("content", "")
+                # Same cap as the get_document tool — an authenticated client must
+                # not be able to force unbounded allocation through resources/read.
+                if len(text) > MAX_DOCUMENT_CHARS:
+                    text = text[:MAX_DOCUMENT_CHARS] + (
+                        f"\n\n[Truncated — full document is {len(data.get('content', ''))} characters "
+                        f"across {data.get('chunk_count', '?')} chunks]"
+                    )
                 return {"jsonrpc": "2.0", "id": result["id"], "result": {
-                    "contents": [{"uri": uri, "mimeType": "text/plain", "text": data.get("content", "")}],
+                    "contents": [{"uri": uri, "mimeType": "text/plain", "text": text}],
                 }}
             except Exception:
                 logger.exception("Resource read failed: %s", uri)

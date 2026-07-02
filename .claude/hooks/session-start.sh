@@ -19,7 +19,7 @@ pip install --quiet \
   pydantic-settings==2.7.1 \
   python-multipart==0.0.18 \
   slowapi==0.1.9 \
-  httpx \
+  httpx==0.28.1 \
   chardet==5.2.0 \
   "pypdf>=4.0.0" \
   APScheduler==3.10.4 \
