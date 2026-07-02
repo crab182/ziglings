@@ -25,13 +25,35 @@ export default function DocPreview({ source, collection = 'default', highlight =
     return () => window.removeEventListener('keydown', onKey)
   }, [onClose])
 
+  // Regex-free highlighting: scan with case-insensitive indexOf so user input
+  // never reaches a RegExp constructor (avoids regex-injection/ReDoS entirely).
   const renderContent = (text) => {
     const terms = highlight.trim().split(/\s+/).filter((t) => t.length > 2)
     if (!terms.length) return text
-    const re = new RegExp(`(${terms.map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})`, 'gi')
-    return text.split(re).map((seg, i) =>
-      re.test(seg) ? <mark key={i}>{seg}</mark> : <span key={i}>{seg}</span>
-    )
+    const lowerTerms = terms.map((t) => t.toLowerCase())
+    const lowerText = text.toLowerCase()
+    const segments = []
+    let pos = 0
+    let key = 0
+    while (pos < text.length) {
+      let best = -1
+      let bestLen = 0
+      for (const t of lowerTerms) {
+        const idx = lowerText.indexOf(t, pos)
+        if (idx !== -1 && (best === -1 || idx < best)) {
+          best = idx
+          bestLen = t.length
+        }
+      }
+      if (best === -1) {
+        segments.push(<span key={key++}>{text.slice(pos)}</span>)
+        break
+      }
+      if (best > pos) segments.push(<span key={key++}>{text.slice(pos, best)}</span>)
+      segments.push(<mark key={key++}>{text.slice(best, best + bestLen)}</mark>)
+      pos = best + bestLen
+    }
+    return segments
   }
 
   return (
