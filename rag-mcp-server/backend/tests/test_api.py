@@ -178,6 +178,16 @@ def run():
     check("status 403 bad key",
           client.get("/api/admin/status", headers={"Authorization": "Bearer wrong"}).status_code == 403)
 
+    r = client.post(
+        "/api/admin/api-keys",
+        headers=hdr,
+        json={"name": "readonly", "is_admin": False},
+    )
+    check("create readonly key", r.status_code == 200, f"{r.status_code}: {r.text[:300]}")
+    readonly_key = r.json().get("key") if r.status_code == 200 else None
+    readonly_hdr = {"Authorization": f"Bearer {readonly_key}"}
+    check("readonly key returned", bool(readonly_key))
+
     # Authenticated reads
     for path in ["/api/admin/status", "/api/admin/api-keys", "/api/admin/config",
                  "/api/documents/collections", "/api/smb/saved"]:
@@ -208,6 +218,73 @@ def run():
           client.delete("/api/documents/collections/default", headers=hdr).status_code == 400)
     check("duplicate key name conflict",
           client.post("/api/admin/api-keys", headers=hdr, json={"name": "admin"}).status_code == 409)
+    check("readonly cannot create collection",
+          client.post("/api/documents/collections/readonly_demo", headers=readonly_hdr).status_code == 403)
+    check("readonly cannot delete collection",
+          client.delete("/api/documents/collections/readonly_demo", headers=readonly_hdr).status_code == 403)
+    r = client.post("/api/documents/collections/demo", headers=hdr)
+    check("admin can create collection", r.status_code == 200, f"{r.status_code}: {r.text[:200]}")
+    r = client.get("/api/documents/collections", headers=hdr)
+    collections = r.json().get("collections", []) if r.status_code == 200 else []
+    collection_names = {c.get("name") if isinstance(c, dict) else c for c in collections}
+    check("created collection listed", "demo" in collection_names, f"{r.status_code}: {r.text[:300]}")
+
+    # Agent API authorization and redaction
+    agent_payload = {
+        "agent_id": "worker_1",
+        "agent_type": "shell",
+        "container_name": "worker-1",
+        "config": {"queue": "default"},
+    }
+    check("readonly cannot register agent",
+          client.post("/api/agents/register", headers=readonly_hdr, json=agent_payload).status_code == 403)
+    check("readonly cannot heartbeat agent",
+          client.post("/api/agents/worker_1/heartbeat", headers=readonly_hdr,
+                      json={"status": "running", "tasks_completed": 1}).status_code == 403)
+    check("admin heartbeat unknown agent is 404",
+          client.post("/api/agents/worker_1/heartbeat", headers=hdr,
+                      json={"status": "running", "tasks_completed": 1}).status_code == 404)
+
+    r = client.post("/api/agents/register", headers=hdr, json=agent_payload)
+    check("admin can register agent", r.status_code == 200, f"{r.status_code}: {r.text[:200]}")
+    r = client.post(
+        "/api/agents/worker_1/tasks",
+        headers=hdr,
+        json={
+            "description": "Run sensitive command",
+            "task_type": "shell",
+            "payload": {"cmd": "printenv SECRET_TOKEN"},
+        },
+    )
+    check("admin can submit agent task", r.status_code == 200, f"{r.status_code}: {r.text[:200]}")
+    submitted_payload = r.json().get("payload") if r.status_code == 200 else {}
+    check("admin task response includes payload",
+          submitted_payload.get("cmd") == "printenv SECRET_TOKEN", f"{submitted_payload}")
+
+    r = client.get("/api/agents/worker_1/status", headers=readonly_hdr)
+    readonly_status = r.json() if r.status_code == 200 else {}
+    check("readonly can read agent status", r.status_code == 200, f"{r.status_code}: {r.text[:200]}")
+    check("readonly status redacts recent tasks",
+          readonly_status.get("recent_tasks") == [], f"{readonly_status}")
+    check("readonly cannot list agent tasks",
+          client.get("/api/agents/worker_1/tasks", headers=readonly_hdr).status_code == 403)
+
+    r = client.get("/api/agents/worker_1/status", headers=hdr)
+    admin_status = r.json() if r.status_code == 200 else {}
+    recent_tasks = admin_status.get("recent_tasks") or []
+    check("admin status includes recent tasks",
+          bool(recent_tasks), f"{r.status_code}: {r.text[:300]}")
+    check("admin recent task preserves payload",
+          recent_tasks[0].get("payload", {}).get("cmd") == "printenv SECRET_TOKEN",
+          f"{recent_tasks[:1]}")
+
+    oversized_config = {f"k{i}": i for i in range(51)}
+    r = client.post(
+        "/api/agents/register",
+        headers=hdr,
+        json={**agent_payload, "agent_id": "too_many_keys", "config": oversized_config},
+    )
+    check("agent register rejects oversized config", r.status_code == 422, f"{r.status_code}: {r.text[:300]}")
 
     # PDF parsing + upload (real PDF bytes through pypdf)
     pdf_bytes = _make_pdf("Router Model X1 - Quick Start Manual")
