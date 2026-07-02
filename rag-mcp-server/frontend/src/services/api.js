@@ -30,10 +30,16 @@ export const clearToken = () => {
 };
 
 // Cross-tab sign-out: when any tab signs out, other tabs clear their token so
-// they stop sending authenticated requests until re-authenticated.
+// they stop sending authenticated requests until re-authenticated. We also
+// dispatch a same-tab event so the React app can reset its auth state (drop
+// back to the sign-in screen) instead of showing a stale authenticated UI.
+export const SIGNOUT_EVENT = 'rmcp:signout';
 if (typeof window !== 'undefined') {
   window.addEventListener('storage', (e) => {
-    if (e.key === _SIGNOUT_SIGNAL) _token = '';
+    if (e.key === _SIGNOUT_SIGNAL) {
+      _token = '';
+      window.dispatchEvent(new Event(SIGNOUT_EVENT));
+    }
   });
 }
 

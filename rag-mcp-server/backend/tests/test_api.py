@@ -206,6 +206,11 @@ def run():
                       json={"query": "x", "collection": "default", "n_results": 9999}).status_code == 422)
     check("delete default collection blocked",
           client.delete("/api/documents/collections/default", headers=hdr).status_code == 400)
+    # A path-like source must never delete a different basename: routing 404s a
+    # slash-containing path, and the handler guard 400s it if an ASGI server
+    # decodes %2F through — either way it must not succeed (200).
+    check("delete path-like document rejected",
+          client.delete("/api/documents/sub%2Freport.pdf", headers=hdr).status_code >= 400)
     check("duplicate key name conflict",
           client.post("/api/admin/api-keys", headers=hdr, json={"name": "admin"}).status_code == 409)
 

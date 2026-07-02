@@ -13,6 +13,7 @@ import {
   getToken,
   setToken,
   clearToken,
+  SIGNOUT_EVENT,
 } from './services/api'
 
 const PAGES = [
@@ -161,6 +162,14 @@ export default function App() {
   }, [])
 
   useEffect(() => { evaluateAuth() }, [])
+
+  // When another tab signs out, api.js clears this tab's token and fires
+  // SIGNOUT_EVENT — reset to the sign-in screen so we don't show stale UI.
+  useEffect(() => {
+    function onSignout() { setAuthState('login') }
+    window.addEventListener(SIGNOUT_EVENT, onSignout)
+    return () => window.removeEventListener(SIGNOUT_EVENT, onSignout)
+  }, [])
 
   async function evaluateAuth() {
     try {

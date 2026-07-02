@@ -6,6 +6,7 @@ so every write is wrapped in try/except and read tolerates malformed lines.
 
 import json
 import logging
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -42,13 +43,16 @@ def read_audit(limit: int = 100) -> list[dict]:
         path = _audit_path()
         if not path.exists():
             return []
-        lines = path.read_text().splitlines()
+        # Stream line-by-line and keep only the last `limit` in a bounded
+        # deque so memory stays proportional to `limit`, not the whole file.
+        with open(path) as f:
+            lines = deque(f, maxlen=limit) if limit and limit > 0 else list(f)
     except Exception:
         logger.exception("Failed to read audit log")
         return []
 
     entries: list[dict] = []
-    for line in lines[-limit:] if limit and limit > 0 else lines:
+    for line in lines:
         line = line.strip()
         if not line:
             continue

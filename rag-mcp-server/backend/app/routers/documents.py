@@ -86,6 +86,12 @@ async def delete_document(
 ):
     validate_collection_name(collection)
     safe_name = safe_filename(filename)
+    # Sources are stored as clean basenames at ingest, so a path-like input
+    # (e.g. "sub/report.pdf") would silently collapse to a different basename
+    # and delete the wrong document. Refuse anything that isn't already its
+    # own basename rather than retargeting.
+    if safe_name != filename:
+        raise HTTPException(400, "Invalid document name")
     deleted = rag_engine.delete_document(safe_name, collection)
     base = Path(settings.documents_dir)
     file_path = safe_join(base, collection, safe_name)
