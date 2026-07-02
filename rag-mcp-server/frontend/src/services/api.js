@@ -1,13 +1,47 @@
 const API_BASE = '/api';
-const TOKEN_KEY = 'rmcp_api_key';
 
-export const getToken = () => localStorage.getItem(TOKEN_KEY) || '';
-export const setToken = (token) => {
-  const trimmed = token ? token.trim() : '';
-  if (trimmed) localStorage.setItem(TOKEN_KEY, trimmed);
-  else localStorage.removeItem(TOKEN_KEY);
+// The admin API key is held in memory for the tab's lifetime only — never
+// written to localStorage/sessionStorage/cookies. This avoids persisting a
+// bearer credential at rest in the browser (CodeQL js/clear-text-storage).
+// Trade-off: the key must be re-entered after a full page reload or new tab.
+const _LEGACY_TOKEN_KEY = 'rmcp_api_key';
+
+// Purge any key persisted by the previous localStorage-based build so an
+// upgraded user doesn't keep an admin bearer key at rest in the browser.
+function _purgeLegacyToken() {
+  try { localStorage.removeItem(_LEGACY_TOKEN_KEY); } catch { /* no-op */ }
+}
+_purgeLegacyToken();
+
+// Non-sensitive sign-out broadcast key: writing a timestamp here fires a
+// `storage` event in OTHER tabs so they drop their in-memory token too. Only a
+// timestamp is ever stored — never the key — so this doesn't re-introduce
+// clear-text credential storage.
+const _SIGNOUT_SIGNAL = 'rmcp_signout';
+
+let _token = '';
+
+export const getToken = () => _token;
+export const setToken = (token) => { _token = token ? token.trim() : ''; };
+export const clearToken = () => {
+  _token = '';
+  _purgeLegacyToken();
+  try { localStorage.setItem(_SIGNOUT_SIGNAL, String(Date.now())); } catch { /* no-op */ }
 };
-export const clearToken = () => localStorage.removeItem(TOKEN_KEY);
+
+// Cross-tab sign-out: when any tab signs out, other tabs clear their token so
+// they stop sending authenticated requests until re-authenticated. We also
+// dispatch a same-tab event so the React app can reset its auth state (drop
+// back to the sign-in screen) instead of showing a stale authenticated UI.
+export const SIGNOUT_EVENT = 'rmcp:signout';
+if (typeof window !== 'undefined') {
+  window.addEventListener('storage', (e) => {
+    if (e.key === _SIGNOUT_SIGNAL) {
+      _token = '';
+      window.dispatchEvent(new Event(SIGNOUT_EVENT));
+    }
+  });
+}
 
 function authHeaders() {
   const token = getToken();
@@ -206,3 +240,4 @@ export const revokeAPIKey = (name) =>
 export const toggleMCP = (enabled) =>
   request(`/admin/mcp/toggle?enabled=${enabled}`, { method: 'POST' });
 export const getConfig = () => request('/admin/config');
+export const getAudit = () => request('/admin/audit');

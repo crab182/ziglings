@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from app.config import load_config, save_config, settings
 from app.models.schemas import APIKeyCreate
 from app.services import auth, rag_engine
+from app.services.audit import append_audit, read_audit
 from app.services.security import require_admin_key, require_api_key
 
 logger = logging.getLogger(__name__)
@@ -44,6 +45,7 @@ async def create_api_key(req: APIKeyCreate, caller: dict = Depends(require_admin
     is_admin = req.is_admin or caller.get("bootstrap", False)
     result = auth.create_api_key(req.name, req.description, is_admin=is_admin)
     logger.info("API key created: name=%s is_admin=%s by=%s", req.name, is_admin, caller.get("name"))
+    append_audit(caller.get("name", "?"), "api_key.create", req.name)
     return {
         "name": result["name"],
         "key": result["raw_key"],
@@ -64,6 +66,7 @@ async def list_api_keys(_: dict = Depends(require_admin_key)):
 async def delete_api_key(name: str, caller: dict = Depends(require_admin_key)):
     if auth.delete_api_key(name):
         logger.info("API key deleted: name=%s by=%s", name, caller.get("name"))
+        append_audit(caller.get("name", "?"), "api_key.delete", name)
         return {"deleted": True, "name": name}
     raise HTTPException(404, f"API key not found: {name}")
 
@@ -72,15 +75,17 @@ async def delete_api_key(name: str, caller: dict = Depends(require_admin_key)):
 async def revoke_api_key(name: str, caller: dict = Depends(require_admin_key)):
     if auth.revoke_api_key(name):
         logger.info("API key revoked: name=%s by=%s", name, caller.get("name"))
+        append_audit(caller.get("name", "?"), "api_key.revoke", name)
         return {"revoked": True, "name": name}
     raise HTTPException(404, f"API key not found: {name}")
 
 
 @router.post("/mcp/toggle")
-async def toggle_mcp(enabled: bool = True, _: dict = Depends(require_admin_key)):
+async def toggle_mcp(enabled: bool = True, caller: dict = Depends(require_admin_key)):
     config = load_config()
     config["mcp_enabled"] = enabled
     save_config(config)
+    append_audit(caller.get("name", "?"), "mcp.toggle", str(enabled))
     return {"mcp_enabled": enabled}
 
 
@@ -129,3 +134,9 @@ async def get_metrics(_: dict = Depends(require_admin_key)):
         "avg_retrieve_ms": round(m.get("total_retrieve_ms", 0) / qc, 1) if qc else 0,
         "avg_rerank_ms": round(m.get("total_rerank_ms", 0) / qc, 1) if qc else 0,
     }
+
+
+@router.get("/audit")
+async def get_audit(_: dict = Depends(require_admin_key)):
+    """Recent admin activity: last 200 audit-log entries (newest last)."""
+    return {"entries": read_audit(200)}

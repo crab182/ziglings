@@ -206,6 +206,11 @@ def run():
                       json={"query": "x", "collection": "default", "n_results": 9999}).status_code == 422)
     check("delete default collection blocked",
           client.delete("/api/documents/collections/default", headers=hdr).status_code == 400)
+    # A path-like source must never delete a different basename: routing 404s a
+    # slash-containing path, and the handler guard 400s it if an ASGI server
+    # decodes %2F through — either way it must not succeed (200).
+    check("delete path-like document rejected",
+          client.delete("/api/documents/sub%2Freport.pdf", headers=hdr).status_code >= 400)
     check("duplicate key name conflict",
           client.post("/api/admin/api-keys", headers=hdr, json={"name": "admin"}).status_code == 409)
 
@@ -273,6 +278,49 @@ def run():
     check("citations instruction in system prompt",
           "[1]" in msgs[0]["content"] and "context blocks" in msgs[0]["content"].lower(),
           msgs[0]["content"][:120])
+
+    # Admin audit log: privileged actions are recorded and readable.
+    r = client.post("/api/documents/collections/audit_test", headers=hdr)
+    check("create collection for audit", r.status_code == 200, f"{r.status_code}: {r.text[:150]}")
+    r = client.get("/api/admin/audit", headers=hdr)
+    check("audit endpoint 200", r.status_code == 200, f"{r.status_code}: {r.text[:150]}")
+    entries = r.json().get("entries", []) if r.status_code == 200 else []
+    check("audit log non-empty", len(entries) > 0, str(entries)[:150])
+    check("audit records collection.create",
+          any(e.get("action") == "collection.create" for e in entries),
+          str([e.get("action") for e in entries])[:200])
+
+    # Contextual retrieval at ingest (opt-in via ENABLE_CONTEXTUAL_INGEST).
+    # Capture what gets stored by wrapping the stub collection's upsert.
+    from app.services import rag_engine as _re
+    _captured = {}
+    _col = _re.get_or_create_collection("ctxtest")
+    _orig_upsert = _col.upsert
+    _orig_ctx = _re._contextualize_sync
+    _col.upsert = lambda **kw: _captured.update(documents=kw.get("documents"))
+    try:
+        # (a) default OFF: the stored chunk is not contextualized, no LLM call.
+        n_off = _re.ingest_text("plain device manual content one",
+                                source="ctx_off", collection_name="ctxtest")
+        off_docs = _captured.get("documents") or []
+        check("contextual default-off leaves chunk unchanged",
+              n_off == len(off_docs) and bool(off_docs) and not off_docs[0].startswith("[Context:"),
+              str(off_docs)[:120])
+
+        # (b) enabled + stubbed contextualizer: stored chunk is prepended.
+        _captured.clear()
+        _re._contextualize_sync = lambda source, section, chunk_text: "[Context: X]\n" + chunk_text
+        _re.ENABLE_CONTEXTUAL_INGEST = True
+        _re.ingest_text("plain device manual content two",
+                        source="ctx_on", collection_name="ctxtest")
+        on_docs = _captured.get("documents") or []
+        check("contextual ingest prepends [Context:] to stored chunk",
+              bool(on_docs) and on_docs[0].startswith("[Context:"),
+              str(on_docs)[:120])
+    finally:
+        _re.ENABLE_CONTEXTUAL_INGEST = False
+        _re._contextualize_sync = _orig_ctx
+        _col.upsert = _orig_upsert
 
     print("\n" + "=" * 50)
     print(f"RESULT: {len(_failures)} failure(s)")

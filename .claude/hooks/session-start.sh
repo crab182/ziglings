@@ -27,11 +27,11 @@ pip install --quiet \
   "uvicorn[standard]==0.34.0" \
   pydantic==2.10.4 \
   pydantic-settings==2.7.1 \
-  python-multipart==0.0.18 \
+  python-multipart==0.0.30 \
   slowapi==0.1.9 \
   httpx==0.28.1 \
   chardet==5.2.0 \
-  pypdf==5.1.0 \
+  pypdf==6.12.0 \
   APScheduler==3.10.4 \
   rank-bm25==0.2.2
 

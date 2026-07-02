@@ -21,8 +21,9 @@ services:
       - LLM_URL=http://ollama:11434
       - LLM_MODEL=${LLM_MODEL:-qwen2.5:14b}
       - ENABLE_HYDE=1   # local LLM is present on GPU deploys, so HyDE is worthwhile
-      # Contextual retrieval enriches chunks at ingest via the LLM (big retrieval
-      # win, slower ingestion). Off by default; set to 1 to enable.
+      # Contextual retrieval enriches each chunk at ingest via the LLM (big
+      # retrieval win, but needs Ollama and noticeably slows ingestion).
+      # Off by default; set to 1 to enable.
       - ENABLE_CONTEXTUAL_INGEST=${ENABLE_CONTEXTUAL_INGEST:-0}
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility

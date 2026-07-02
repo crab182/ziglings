@@ -1,17 +1,19 @@
 import React, { useState, useEffect } from 'react'
-import { getStatus, getMetrics, getMcpInfo } from '../services/api'
+import { getStatus, getMetrics, getMcpInfo, getAudit } from '../services/api'
 import HelpBubble from '../components/HelpBubble'
 
 export default function Dashboard() {
   const [status, setStatus] = useState(null)
   const [metrics, setMetrics] = useState(null)
   const [mcp, setMcp] = useState(null)
+  const [audit, setAudit] = useState([])
   const [error, setError] = useState(null)
 
   useEffect(() => {
     getStatus().then(setStatus).catch(e => setError(e.message))
     getMetrics().then(setMetrics).catch(() => {})
     getMcpInfo().then(setMcp).catch(() => {})
+    getAudit().then(r => setAudit(r.entries || [])).catch(() => {})
   }, [])
 
   if (error) return <div className="alert alert-error">{error}</div>
@@ -126,6 +128,30 @@ export default function Dashboard() {
           Use your API key as a Bearer token in the Authorization header.
         </p>
       </div>
+
+      {audit.length > 0 && (
+        <div className="card">
+          <div className="card-header">
+            <h3>
+              Recent Admin Activity
+              <HelpBubble text="Privileged actions (key creation/revocation, collection changes, MCP toggle) recorded server-side. Newest first." />
+            </h3>
+          </div>
+          <table className="table">
+            <thead><tr><th>When</th><th>Actor</th><th>Action</th><th>Target</th></tr></thead>
+            <tbody>
+              {audit.slice().reverse().slice(0, 20).map((e, i) => (
+                <tr key={`${e.ts}-${i}`}>
+                  <td>{e.ts ? new Date(e.ts).toLocaleString() : '—'}</td>
+                  <td>{e.actor || '—'}</td>
+                  <td><span className="citation-badge">{e.action}</span></td>
+                  <td>{e.target || '—'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   )
 }
