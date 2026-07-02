@@ -13,11 +13,29 @@ function _purgeLegacyToken() {
 }
 _purgeLegacyToken();
 
+// Non-sensitive sign-out broadcast key: writing a timestamp here fires a
+// `storage` event in OTHER tabs so they drop their in-memory token too. Only a
+// timestamp is ever stored — never the key — so this doesn't re-introduce
+// clear-text credential storage.
+const _SIGNOUT_SIGNAL = 'rmcp_signout';
+
 let _token = '';
 
 export const getToken = () => _token;
 export const setToken = (token) => { _token = token ? token.trim() : ''; };
-export const clearToken = () => { _token = ''; _purgeLegacyToken(); };
+export const clearToken = () => {
+  _token = '';
+  _purgeLegacyToken();
+  try { localStorage.setItem(_SIGNOUT_SIGNAL, String(Date.now())); } catch { /* no-op */ }
+};
+
+// Cross-tab sign-out: when any tab signs out, other tabs clear their token so
+// they stop sending authenticated requests until re-authenticated.
+if (typeof window !== 'undefined') {
+  window.addEventListener('storage', (e) => {
+    if (e.key === _SIGNOUT_SIGNAL) _token = '';
+  });
+}
 
 function authHeaders() {
   const token = getToken();
@@ -216,3 +234,4 @@ export const revokeAPIKey = (name) =>
 export const toggleMCP = (enabled) =>
   request(`/admin/mcp/toggle?enabled=${enabled}`, { method: 'POST' });
 export const getConfig = () => request('/admin/config');
+export const getAudit = () => request('/admin/audit');
