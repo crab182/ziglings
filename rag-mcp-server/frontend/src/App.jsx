@@ -13,6 +13,7 @@ import {
   getToken,
   setToken,
   clearToken,
+  signOut as apiSignOut,
   SIGNOUT_EVENT,
 } from './services/api'
 
@@ -198,7 +199,7 @@ export default function App() {
   }
 
   function signOut() {
-    clearToken()
+    apiSignOut()
     setAuthState('login')
   }
 
