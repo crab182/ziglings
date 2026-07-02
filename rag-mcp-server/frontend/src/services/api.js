@@ -4,11 +4,20 @@ const API_BASE = '/api';
 // written to localStorage/sessionStorage/cookies. This avoids persisting a
 // bearer credential at rest in the browser (CodeQL js/clear-text-storage).
 // Trade-off: the key must be re-entered after a full page reload or new tab.
+const _LEGACY_TOKEN_KEY = 'rmcp_api_key';
+
+// Purge any key persisted by the previous localStorage-based build so an
+// upgraded user doesn't keep an admin bearer key at rest in the browser.
+function _purgeLegacyToken() {
+  try { localStorage.removeItem(_LEGACY_TOKEN_KEY); } catch { /* no-op */ }
+}
+_purgeLegacyToken();
+
 let _token = '';
 
 export const getToken = () => _token;
 export const setToken = (token) => { _token = token ? token.trim() : ''; };
-export const clearToken = () => { _token = ''; };
+export const clearToken = () => { _token = ''; _purgeLegacyToken(); };
 
 function authHeaders() {
   const token = getToken();
