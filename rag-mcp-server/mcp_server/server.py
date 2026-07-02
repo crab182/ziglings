@@ -14,6 +14,7 @@ import re
 import uuid
 from pathlib import Path
 from typing import AsyncGenerator
+from urllib.parse import quote
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request, Response
@@ -272,10 +273,32 @@ TOOLS = [
             "required": ["name"],
         },
     },
+    {
+        "name": "delete_document",
+        "description": "Delete a document (all its indexed chunks and the stored file) from a collection by source name. Requires an admin-tier API key.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "source": {"type": "string", "description": "The document's source name as shown by list_documents (e.g. 'manual.pdf')"},
+                "collection": {"type": "string", "description": "Collection name (default: 'default')", "default": "default"},
+            },
+            "required": ["source"],
+        },
+    },
+    {
+        "name": "get_collection_stats",
+        "description": "Get per-collection statistics: unique document count and indexed chunk count. Optionally filter to a single collection.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "collection": {"type": "string", "description": "Optional collection name; omit for all collections"},
+            },
+        },
+    },
 ]
 
 
-ADMIN_TOOLS = {"ingest_note", "submit_agent_task", "get_agent_tasks", "create_collection", "delete_collection"}
+ADMIN_TOOLS = {"ingest_note", "submit_agent_task", "get_agent_tasks", "create_collection", "delete_collection", "delete_document"}
 
 # Mirrors backend validate_collection_name
 
@@ -425,6 +448,57 @@ async def handle_tool_call(name: str, arguments: dict, caller_is_admin: bool) ->
                 "content": [
                     {"type": "text", "text": text},
                     {"type": "text", "text": json.dumps(data)},
+                ],
+                "isError": False,
+            }
+
+        elif name == "delete_document":
+            collection = arguments.get("collection", "default")
+            bad = _reject_bad_name(collection)
+            if bad:
+                return bad
+            source = arguments.get("source", "")
+            if not source:
+                return {"content": [{"type": "text", "text": "A 'source' argument is required."}], "isError": True}
+            # quote(safe='') encodes any '/' so the source can't traverse the URL path.
+            resp = await client.delete(
+                f"/api/documents/{quote(source, safe='')}",
+                params={"collection": collection},
+            )
+            if resp.status_code >= 400:
+                return {"content": [{"type": "text", "text": _detail(resp)}], "isError": True}
+            resp.raise_for_status()
+            data = resp.json()
+            n = data.get("deleted_chunks", 0)
+            text = (f"Deleted **{data.get('filename', source)}** from **{collection}** "
+                    f"({n} chunk{'s' if n != 1 else ''} removed)." if n
+                    else f"No document named **{source}** was found in **{collection}**.")
+            return {
+                "content": [
+                    {"type": "text", "text": text},
+                    {"type": "text", "text": json.dumps(data)},
+                ],
+                "isError": False,
+            }
+
+        elif name == "get_collection_stats":
+            resp = await client.get("/api/documents/collections")
+            resp.raise_for_status()
+            cols = resp.json().get("collections", [])
+            wanted = arguments.get("collection")
+            if wanted:
+                cols = [c for c in cols if c.get("name") == wanted]
+                if not cols:
+                    return {"content": [{"type": "text", "text": f"Collection '{wanted}' not found."}], "isError": True}
+            lines = [
+                f"- **{c['name']}**: {c.get('document_count', 0)} documents, {c.get('chunk_count', 0)} chunks"
+                for c in cols
+            ]
+            text = "\n".join(lines) or "No collections."
+            return {
+                "content": [
+                    {"type": "text", "text": text},
+                    {"type": "text", "text": json.dumps(cols)},
                 ],
                 "isError": False,
             }

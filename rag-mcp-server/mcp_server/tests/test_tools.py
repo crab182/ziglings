@@ -215,10 +215,76 @@ class ToolsListTests(unittest.TestCase):
         names = {t["name"] for t in server.TOOLS}
         self.assertIn("create_collection", names)
         self.assertIn("delete_collection", names)
+        self.assertIn("delete_document", names)
+        self.assertIn("get_collection_stats", names)
 
     def test_new_tools_admin_gated(self):
         self.assertIn("create_collection", server.ADMIN_TOOLS)
         self.assertIn("delete_collection", server.ADMIN_TOOLS)
+        self.assertIn("delete_document", server.ADMIN_TOOLS)
+        # Read-only stats must NOT require admin.
+        self.assertNotIn("get_collection_stats", server.ADMIN_TOOLS)
+
+
+class DeleteDocumentTests(unittest.TestCase):
+    def test_admin_required(self):
+        # Admin gate fires before any client is created (client stays None).
+        result, client = _call("delete_document", {"source": "x.pdf"}, is_admin=False)
+        self.assertTrue(result["isError"])
+        self.assertIsNone(client)
+
+    def test_success_dual_format_and_url_encoded(self):
+        result, client = _call(
+            "delete_document",
+            {"source": "router.pdf", "collection": "manuals"},
+            responses={("DELETE", "/api/documents/router.pdf"):
+                       FakeResponse(200, {"deleted_chunks": 7, "filename": "router.pdf"})},
+        )
+        self.assertFalse(result["isError"])
+        self.assertEqual(client.calls[0][:2], ("DELETE", "/api/documents/router.pdf"))
+        self.assertEqual(len(result["content"]), 2)
+        self.assertEqual(json.loads(result["content"][1]["text"])["deleted_chunks"], 7)
+
+    def test_traversal_source_is_encoded_not_raw(self):
+        # A slashy source must be percent-encoded, never a raw ../ path segment.
+        result, client = _call(
+            "delete_document",
+            {"source": "../../admin/api-keys/victim", "collection": "default"},
+            responses={},  # 404 fallback; we only assert the path shape
+        )
+        for verb, path, _ in client.calls:
+            self.assertNotIn("../", path)
+
+    def test_bad_collection_rejected_without_request(self):
+        result, client = _call("delete_document", {"source": "x", "collection": "a/b"}, is_admin=True)
+        self.assertTrue(result["isError"])
+        self.assertEqual(client.calls, [])
+        self.assertIn("Collection name", result["content"][0]["text"])
+
+
+class CollectionStatsTests(unittest.TestCase):
+    _COLS = {("GET", "/api/documents/collections"): None}
+
+    def _stats_resp(self):
+        return {("GET", "/api/documents/collections"): FakeResponse(200, {"collections": [
+            {"name": "default", "document_count": 3, "chunk_count": 40},
+            {"name": "manuals", "document_count": 1, "chunk_count": 12},
+        ]})}
+
+    def test_all_collections(self):
+        result, _ = _call("get_collection_stats", {}, is_admin=False, responses=self._stats_resp())
+        self.assertFalse(result["isError"])
+        self.assertIn("manuals", result["content"][0]["text"])
+        self.assertEqual(len(json.loads(result["content"][1]["text"])), 2)
+
+    def test_filtered(self):
+        result, _ = _call("get_collection_stats", {"collection": "manuals"}, responses=self._stats_resp())
+        self.assertEqual(json.loads(result["content"][1]["text"]),
+                         [{"name": "manuals", "document_count": 1, "chunk_count": 12}])
+
+    def test_unknown_collection(self):
+        result, _ = _call("get_collection_stats", {"collection": "nope"}, responses=self._stats_resp())
+        self.assertTrue(result["isError"])
 
 
 if __name__ == "__main__":
