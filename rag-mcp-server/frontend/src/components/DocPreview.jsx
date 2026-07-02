@@ -27,6 +27,8 @@ export default function DocPreview({ source, collection = 'default', highlight =
 
   // Regex-free highlighting: scan with case-insensitive indexOf so user input
   // never reaches a RegExp constructor (avoids regex-injection/ReDoS entirely).
+  // NOTE: do not "simplify" this back to `new RegExp(highlight)` — the query
+  // string is untrusted user input and would reintroduce a CodeQL high alert.
   const renderContent = (text) => {
     const terms = highlight.trim().split(/\s+/).filter((t) => t.length > 2)
     if (!terms.length) return text
