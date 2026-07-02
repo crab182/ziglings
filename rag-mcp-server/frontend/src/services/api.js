@@ -23,9 +23,19 @@ let _token = '';
 
 export const getToken = () => _token;
 export const setToken = (token) => { _token = token ? token.trim() : ''; };
+// Clear the in-memory token locally only (no cross-tab broadcast). Used for
+// transient clears — a rejected login attempt, a stale/invalid token — which
+// must NOT sign valid sessions out of other tabs.
 export const clearToken = () => {
   _token = '';
   _purgeLegacyToken();
+};
+
+// Explicit user sign-out: clear locally AND broadcast to other tabs so they
+// drop their in-memory token too. Only a timestamp is written to localStorage,
+// never the key.
+export const signOut = () => {
+  clearToken();
   try { localStorage.setItem(_SIGNOUT_SIGNAL, String(Date.now())); } catch { /* no-op */ }
 };
 

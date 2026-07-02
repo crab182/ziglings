@@ -286,7 +286,13 @@ def _contextualize_sync(source: str, section: str, chunk_text: str) -> str:
 
 
 def ingest_text(text: str, source: str, collection_name: str = "default", metadata: dict | None = None):
-    content_hash = _compute_content_hash(text)
+    # Fold the contextual-ingest setting into the dedup key: when it's on we
+    # store an LLM-written "[Context: …]" prefix in each chunk body, so the same
+    # raw text produces different stored content depending on the flag. Keying
+    # on raw text alone would let an unchanged file skip re-ingest after the flag
+    # flips, leaving stale contextual prefixes in excerpts/reconstructed content.
+    ctx_tag = "ctx1" if ENABLE_CONTEXTUAL_INGEST else "ctx0"
+    content_hash = _compute_content_hash(f"{ctx_tag}\x00{text}")
     if _check_content_hash(source, collection_name, content_hash):
         logger.info("Skipping %s in %s (content unchanged)", source, collection_name)
         return 0
