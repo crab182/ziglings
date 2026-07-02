@@ -1,33 +1,43 @@
 import hashlib
 import logging
 import os
+import re
+import time
 from pathlib import Path
 
 import chromadb
 from chromadb.config import Settings as ChromaSettings
 from sentence_transformers import SentenceTransformer
 
-from app.config import settings
+from app.config import settings, atomic_update
+from app.services.sanitize import sanitize_chunk
+
+RERANKER_MODEL = os.environ.get("RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
 
 logger = logging.getLogger(__name__)
 
 _embedding_model: SentenceTransformer | None = None
 _chroma_client: chromadb.ClientAPI | None = None
+_reranker = None
 
+# Cached BM25 index per collection: {collection_name: (doc_count, BM25Okapi, all_data)}
+_bm25_cache: dict[str, tuple] = {}
+
+_metrics = {"query_count": 0, "ingest_count": 0, "total_retrieve_ms": 0, "total_rerank_ms": 0}
+
+
+# ---------------------------------------------------------------------------
+# Model / DB initialization
+# ---------------------------------------------------------------------------
 
 def _resolve_device() -> str:
-    """Pick the embedding device. EMBEDDING_DEVICE=auto|cpu|cuda (default auto)."""
     requested = os.environ.get("EMBEDDING_DEVICE", "auto").lower()
     if requested == "cpu":
         return "cpu"
     try:
         import torch
         if requested == "cuda":
-            if torch.cuda.is_available():
-                return "cuda"
-            logger.warning("EMBEDDING_DEVICE=cuda requested but no CUDA device found; falling back to CPU")
-            return "cpu"
-        # auto
+            return "cuda" if torch.cuda.is_available() else "cpu"
         return "cuda" if torch.cuda.is_available() else "cpu"
     except Exception:
         return "cpu"
@@ -39,7 +49,7 @@ def get_embedding_model() -> SentenceTransformer:
         device = _resolve_device()
         logger.info("Loading embedding model %s on device=%s", settings.embedding_model, device)
         _embedding_model = SentenceTransformer(settings.embedding_model, device=device)
-        logger.info("Embedding model loaded on %s", device)
+        logger.info("Embedding model loaded (%d-dim)", _embedding_model.get_sentence_embedding_dimension())
     return _embedding_model
 
 
@@ -51,7 +61,7 @@ def get_chroma_client() -> chromadb.ClientAPI:
             path=settings.chroma_persist_dir,
             settings=ChromaSettings(anonymized_telemetry=False),
         )
-        logger.info(f"ChromaDB initialized at {settings.chroma_persist_dir}")
+        logger.info("ChromaDB initialized at %s", settings.chroma_persist_dir)
     return _chroma_client
 
 
@@ -65,7 +75,12 @@ def get_or_create_collection(name: str = "default"):
     )
 
 
+# ---------------------------------------------------------------------------
+# Chunking
+# ---------------------------------------------------------------------------
+
 def chunk_text(text: str, chunk_size: int = 512, overlap: int = 64) -> list[str]:
+    """Simple word-based chunking for plain text."""
     words = text.split()
     chunks = []
     start = 0
@@ -78,43 +93,263 @@ def chunk_text(text: str, chunk_size: int = 512, overlap: int = 64) -> list[str]
     return chunks if chunks else [text]
 
 
+def _is_table_line(line: str) -> bool:
+    stripped = line.strip()
+    return stripped.startswith("|") and "|" in stripped[1:]
+
+
+def _extract_page_number(text: str) -> int | None:
+    m = re.search(r"<!--\s*page\s+(\d+)\s*-->", text)
+    return int(m.group(1)) if m else None
+
+
+def chunk_text_structured(text: str, max_words: int = 512) -> list[dict]:
+    """Markdown-aware chunker. Returns list of {text, section_header, page_number}."""
+    sections: list[tuple[str, str]] = []
+    current_header = ""
+    current_lines: list[str] = []
+
+    for line in text.split("\n"):
+        if re.match(r"^#{1,3}\s+", line):
+            if current_lines:
+                sections.append((current_header, "\n".join(current_lines)))
+                current_lines = []
+            current_header = line.lstrip("#").strip()
+        else:
+            current_lines.append(line)
+    if current_lines:
+        sections.append((current_header, "\n".join(current_lines)))
+
+    result: list[dict] = []
+    for header, body in sections:
+        paragraphs: list[str] = []
+        buf: list[str] = []
+        in_table = False
+
+        for line in body.split("\n"):
+            is_tbl = _is_table_line(line)
+            if is_tbl:
+                if not in_table and buf:
+                    paragraphs.append("\n".join(buf))
+                    buf = []
+                in_table = True
+                buf.append(line)
+            else:
+                if in_table:
+                    paragraphs.append("\n".join(buf))
+                    buf = []
+                    in_table = False
+                if line.strip() == "" and buf:
+                    paragraphs.append("\n".join(buf))
+                    buf = []
+                elif line.strip():
+                    buf.append(line)
+        if buf:
+            paragraphs.append("\n".join(buf))
+
+        merged = ""
+        for para in paragraphs:
+            candidate = (merged + "\n\n" + para).strip() if merged else para
+            if len(candidate.split()) <= max_words:
+                merged = candidate
+            else:
+                if merged:
+                    result.append({"text": merged, "section_header": header, "page_number": _extract_page_number(merged)})
+                merged = para
+        if merged.strip():
+            result.append({"text": merged, "section_header": header, "page_number": _extract_page_number(merged)})
+
+    return result if result else [{"text": text, "section_header": "", "page_number": None}]
+
+
+def _looks_like_markdown(text: str) -> bool:
+    if re.search(r"^#{1,3}\s+", text, re.MULTILINE):
+        return True
+    lines = text.split("\n")
+    table_lines = sum(1 for l in lines[:50] if _is_table_line(l))
+    if table_lines >= 2:
+        return True
+    if re.search(r"<!--\s*page\s+\d+\s*-->", text):
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Reranker
+# ---------------------------------------------------------------------------
+
+def _get_reranker():
+    global _reranker
+    if _reranker is not None:
+        return _reranker
+    try:
+        from sentence_transformers import CrossEncoder
+        _reranker = CrossEncoder(RERANKER_MODEL)
+        logger.info("Loaded reranker: %s", RERANKER_MODEL)
+        return _reranker
+    except Exception as e:
+        logger.warning("Reranker unavailable (%s): %s", RERANKER_MODEL, e)
+        return None
+
+
+def _rerank(query: str, results: list[dict], top_k: int = 8) -> list[dict]:
+    reranker = _get_reranker()
+    if not reranker or not results:
+        return results[:top_k]
+    pairs = [(query, r["content"]) for r in results]
+    scores = reranker.predict(pairs)
+    for r, s in zip(results, scores):
+        r["rerank_score"] = round(float(s), 4)
+    results.sort(key=lambda r: r.get("rerank_score", 0), reverse=True)
+    return results[:top_k]
+
+
+# ---------------------------------------------------------------------------
+# Ingestion (with content-hash dedup under file lock)
+# ---------------------------------------------------------------------------
+
 def compute_doc_id(source: str, chunk_idx: int) -> str:
     return hashlib.sha256(f"{source}::{chunk_idx}".encode()).hexdigest()[:16]
 
 
+def _compute_content_hash(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def _check_content_hash(source: str, collection_name: str, content_hash: str) -> bool:
+    """Atomic check-and-update under file lock. Returns True if unchanged."""
+    def _update(config):
+        hashes = config.setdefault("content_hashes", {}).setdefault(collection_name, {})
+        if hashes.get(source) == content_hash:
+            return True
+        hashes[source] = content_hash
+        return False
+    return atomic_update(_update)
+
+
+def _remove_content_hash(source: str, collection_name: str):
+    def _update(config):
+        hashes = config.get("content_hashes", {}).get(collection_name, {})
+        hashes.pop(source, None)
+    atomic_update(_update)
+
+
+# Contextual retrieval (opt-in): an LLM writes a 1-2 sentence situating context
+# per chunk, prepended before embedding. Big retrieval win, slow ingest, needs Ollama.
+ENABLE_CONTEXTUAL_INGEST = os.environ.get("ENABLE_CONTEXTUAL_INGEST", "0") == "1"
+_CTX_TIMEOUT = float(os.environ.get("CONTEXTUAL_TIMEOUT", "20"))
+_ctx_unavailable_until = 0.0
+
+
+def _contextualize_chunk(doc_summary: str, source: str, chunk: str) -> str:
+    """Return a short context sentence for a chunk, or '' if LLM unavailable."""
+    global _ctx_unavailable_until
+    if time.monotonic() < _ctx_unavailable_until:
+        return ""
+    try:
+        from app.services.llm import LLM_URL, LLM_MODEL
+        import httpx
+        prompt = (
+            f"Document: {source}\nDocument overview:\n{doc_summary[:1500]}\n\n"
+            f"Chunk:\n{chunk[:1500]}\n\n"
+            "Give a 1-2 sentence context situating this chunk within the document, "
+            "to improve search retrieval. Answer with only the context sentence(s)."
+        )
+        resp = httpx.post(
+            f"{LLM_URL}/v1/chat/completions",
+            json={"model": LLM_MODEL,
+                  "messages": [{"role": "user", "content": prompt}],
+                  "temperature": 0.0, "max_tokens": 120},
+            timeout=_CTX_TIMEOUT,
+        )
+        if resp.status_code == 200:
+            return resp.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+    except Exception:
+        _ctx_unavailable_until = time.monotonic() + 300.0
+        logger.info("Contextual ingest LLM unreachable; disabling for 300s")
+    return ""
+
+
 def ingest_text(text: str, source: str, collection_name: str = "default", metadata: dict | None = None):
-    model = get_embedding_model()
-    collection = get_or_create_collection(collection_name)
-    chunks = chunk_text(text)
-    if not chunks:
+    content_hash = _compute_content_hash(text)
+    if _check_content_hash(source, collection_name, content_hash):
+        logger.info("Skipping %s in %s (content unchanged)", source, collection_name)
         return 0
 
-    ids = [compute_doc_id(source, i) for i in range(len(chunks))]
-    embeddings = model.encode(chunks).tolist()
-    metadatas = [
-        {**(metadata or {}), "source": source, "chunk_index": i}
-        for i in range(len(chunks))
-    ]
+    model = get_embedding_model()
+    collection = get_or_create_collection(collection_name)
 
-    collection.upsert(ids=ids, documents=chunks, embeddings=embeddings, metadatas=metadatas)
-    logger.info(f"Ingested {len(chunks)} chunks from {source} into {collection_name}")
-    return len(chunks)
+    if _looks_like_markdown(text):
+        structured = chunk_text_structured(text)
+        chunk_texts = [c["text"] for c in structured]
+        extra_meta = [
+            {"section_header": c.get("section_header", ""), "page_number": c.get("page_number")}
+            for c in structured
+        ]
+    else:
+        chunk_texts = chunk_text(text)
+        extra_meta = [{} for _ in chunk_texts]
 
+    if not chunk_texts:
+        return 0
+
+    ids = [compute_doc_id(source, i) for i in range(len(chunk_texts))]
+
+    # Contextual retrieval: embed (context + chunk) but store the original chunk.
+    embed_texts = chunk_texts
+    if ENABLE_CONTEXTUAL_INGEST:
+        doc_summary = " ".join(text.split()[:400])
+        embed_texts = []
+        for i, ch in enumerate(chunk_texts):
+            ctx = _contextualize_chunk(doc_summary, source, ch)
+            embed_texts.append(f"{ctx}\n{ch}" if ctx else ch)
+
+    embeddings = model.encode(embed_texts).tolist()
+    metadatas = []
+    for i, em in enumerate(extra_meta):
+        m = {**(metadata or {}), "source": source, "chunk_index": i}
+        if em.get("section_header"):
+            m["section_header"] = em["section_header"]
+        if em.get("page_number") is not None:
+            m["page_number"] = em["page_number"]
+        if i > 0:
+            m["prev_chunk_id"] = ids[i - 1]
+        if i < len(chunk_texts) - 1:
+            m["next_chunk_id"] = ids[i + 1]
+        metadatas.append(m)
+
+    collection.upsert(ids=ids, documents=chunk_texts, embeddings=embeddings, metadatas=metadatas)
+    _bm25_cache.pop(collection_name, None)  # invalidate BM25 cache
+    _metrics["ingest_count"] += 1
+    logger.info("Ingested %d chunks from %s into %s", len(chunk_texts), source, collection_name)
+    return len(chunk_texts)
+
+
+# ---------------------------------------------------------------------------
+# BM25 search (cached index per collection)
+# ---------------------------------------------------------------------------
 
 def _bm25_search(query_text: str, collection_name: str, n_results: int) -> list[tuple[str, str, dict]]:
-    """BM25 keyword search over all chunks in a collection. Returns (id, doc, meta) tuples."""
     try:
         from rank_bm25 import BM25Okapi
     except ImportError:
         return []
     collection = get_or_create_collection(collection_name)
-    if collection.count() == 0:
+    count = collection.count()
+    if count == 0:
         return []
-    all_data = collection.get(include=["documents", "metadatas"])
-    if not all_data["documents"]:
-        return []
-    tokenized = [doc.lower().split() for doc in all_data["documents"]]
-    bm25 = BM25Okapi(tokenized)
+
+    cached = _bm25_cache.get(collection_name)
+    if cached and cached[0] == count:
+        _, bm25, all_data = cached
+    else:
+        all_data = collection.get(include=["documents", "metadatas"])
+        if not all_data["documents"]:
+            return []
+        tokenized = [doc.lower().split() for doc in all_data["documents"]]
+        bm25 = BM25Okapi(tokenized)
+        _bm25_cache[collection_name] = (count, bm25, all_data)
+
     scores = bm25.get_scores(query_text.lower().split())
     top_idx = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:n_results]
     return [
@@ -128,7 +363,6 @@ def _reciprocal_rank_fusion(
     bm25_results: list[tuple[str, str, dict]],
     k: int = 60,
 ) -> list[dict]:
-    """Combine vector + BM25 results via RRF. Returns fused list ranked by combined score."""
     scores: dict[str, float] = {}
     docs: dict[str, dict] = {}
 
@@ -152,16 +386,118 @@ def _reciprocal_rank_fusion(
     return [{**docs[did], "score": round(scores[did], 4)} for did in ranked]
 
 
+# HyDE is opt-in: it only helps when a local LLM (Ollama) is reachable, so it
+# defaults off and should be enabled (ENABLE_HYDE=1) on GPU deployments.
+ENABLE_HYDE = os.environ.get("ENABLE_HYDE", "0") == "1"
+
+# Circuit breaker: if the LLM is unreachable, stop attempting HyDE for a while
+# so a dead Ollama can't add latency to every query.
+_HYDE_TIMEOUT = float(os.environ.get("HYDE_TIMEOUT", "8"))
+_HYDE_COOLDOWN = 300.0  # seconds to skip HyDE after a failure
+_hyde_unavailable_until = 0.0
+
+
+def _hyde_expand_sync(query_text: str) -> str | None:
+    """Generate a hypothetical answer to use as the search embedding (HyDE technique).
+    Synchronous; runs inside the threadpool via asyncio.to_thread in the router."""
+    global _hyde_unavailable_until
+    if not ENABLE_HYDE:
+        return None
+    if time.monotonic() < _hyde_unavailable_until:
+        return None  # circuit open — skip until cooldown elapses
+    try:
+        from app.services.llm import LLM_URL, LLM_MODEL
+        import httpx
+        resp = httpx.post(
+            f"{LLM_URL}/v1/chat/completions",
+            json={
+                "model": LLM_MODEL,
+                "messages": [
+                    {"role": "system", "content": "Write a short factual paragraph that would answer this question. Do not say 'I don't know'. Just write the answer as if you know it."},
+                    {"role": "user", "content": query_text},
+                ],
+                "temperature": 0.0,
+                "max_tokens": 200,
+            },
+            timeout=_HYDE_TIMEOUT,
+        )
+        if resp.status_code == 200:
+            answer = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+            if answer:
+                return answer
+    except Exception:
+        # LLM unreachable — open the circuit so we stop trying for a while
+        _hyde_unavailable_until = time.monotonic() + _HYDE_COOLDOWN
+        logger.info("HyDE LLM unreachable; disabling HyDE for %ds", int(_HYDE_COOLDOWN))
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Parent-child context expansion (uses stored prev/next chunk ids)
+# ---------------------------------------------------------------------------
+
+EXPAND_CONTEXT = os.environ.get("EXPAND_CONTEXT", "1") == "1"
+EXPAND_MAX_WORDS = int(os.environ.get("EXPAND_MAX_WORDS", "900"))
+_EXPAND_TOP_N = 3
+
+
+def _expand_results(collection, results: list[dict]):
+    """Attach expanded_content (prev + chunk + next) to the top results so the
+    LLM sees more context, while search UIs keep the original chunk."""
+    want_ids: set[str] = set()
+    for item in results[:_EXPAND_TOP_N]:
+        meta = item.get("metadata", {}) or {}
+        for k in ("prev_chunk_id", "next_chunk_id"):
+            if meta.get(k):
+                want_ids.add(meta[k])
+    if not want_ids:
+        return
+    try:
+        fetched = collection.get(ids=list(want_ids), include=["documents"])
+    except Exception:
+        logger.exception("Context expansion fetch failed")
+        return
+    by_id = dict(zip(fetched.get("ids", []), fetched.get("documents", [])))
+
+    for item in results[:_EXPAND_TOP_N]:
+        meta = item.get("metadata", {}) or {}
+        prev_text = by_id.get(meta.get("prev_chunk_id", ""), "")
+        next_text = by_id.get(meta.get("next_chunk_id", ""), "")
+        if not prev_text and not next_text:
+            continue
+        content = item["content"]
+        budget = max(EXPAND_MAX_WORDS - len(content.split()), 0)
+        half = budget // 2
+        prev_words = prev_text.split()
+        next_words = next_text.split()
+        prev_trim = " ".join(prev_words[-half:]) if half and prev_words else ""
+        next_trim = " ".join(next_words[:half]) if half and next_words else ""
+        parts = [p for p in (prev_trim, content, next_trim) if p]
+        item["expanded_content"] = "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Query (vector + BM25 + rerank + sanitize + observability)
+# ---------------------------------------------------------------------------
+
+def get_metrics() -> dict:
+    return {**_metrics}
+
+
 def query(query_text: str, collection_name: str = "default", n_results: int = 5) -> list[dict]:
+    t0 = time.monotonic()
     model = get_embedding_model()
     collection = get_or_create_collection(collection_name)
 
     if collection.count() == 0:
         return []
 
-    # Dense vector search — fetch extra candidates for fusion
+    # HyDE: embed a hypothetical answer instead of the raw query (when LLM is available)
+    hyde_text = _hyde_expand_sync(query_text)
+    embed_text = hyde_text if hyde_text else query_text
+
     fetch_n = min(max(n_results * 5, 30), collection.count())
-    query_embedding = model.encode([query_text]).tolist()
+    query_embedding = model.encode([embed_text]).tolist()
     results = collection.query(
         query_embeddings=query_embedding,
         n_results=fetch_n,
@@ -181,22 +517,51 @@ def query(query_text: str, collection_name: str = "default", n_results: int = 5)
             "metadata": meta,
         })
 
-    # BM25 sparse search + Reciprocal Rank Fusion
+    t_retrieve = time.monotonic()
+
     bm25_hits = _bm25_search(query_text, collection_name, fetch_n)
     if bm25_hits:
         fused = _reciprocal_rank_fusion(vector_hits, bm25_hits)
     else:
         fused = vector_hits
 
-    return fused[:n_results]
+    t_rerank_start = time.monotonic()
+    if len(fused) > n_results:
+        fused = _rerank(query_text, fused, top_k=n_results)
+    t_rerank = time.monotonic()
 
+    top = fused[:n_results]
+    if EXPAND_CONTEXT:
+        _expand_results(collection, top)
+    for item in top:
+        item["content"] = sanitize_chunk(item["content"])
+        if item.get("expanded_content"):
+            item["expanded_content"] = sanitize_chunk(item["expanded_content"])
+
+    total_ms = round((time.monotonic() - t0) * 1000, 1)
+    retrieve_ms = round((t_retrieve - t0) * 1000, 1)
+    rerank_ms = round((t_rerank - t_rerank_start) * 1000, 1)
+    logger.info("Query [%s] %d results in %.0fms (retrieve=%.0f, rerank=%.0f)",
+                collection_name, len(top), total_ms, retrieve_ms, rerank_ms)
+    _metrics["query_count"] += 1
+    _metrics["total_retrieve_ms"] += retrieve_ms
+    _metrics["total_rerank_ms"] += rerank_ms
+
+    return top
+
+
+# ---------------------------------------------------------------------------
+# Document management
+# ---------------------------------------------------------------------------
 
 def delete_document(source: str, collection_name: str = "default"):
     collection = get_or_create_collection(collection_name)
     results = collection.get(where={"source": source})
     if results["ids"]:
         collection.delete(ids=results["ids"])
-        logger.info(f"Deleted {len(results['ids'])} chunks for {source}")
+        _remove_content_hash(source, collection_name)
+        _bm25_cache.pop(collection_name, None)
+        logger.info("Deleted %d chunks for %s", len(results["ids"]), source)
         return len(results["ids"])
     return 0
 
@@ -220,13 +585,26 @@ def list_collections() -> list[dict]:
     for name in collection_names:
         try:
             col = client.get_collection(name)
-            result.append({"name": name, "document_count": col.count()})
+            chunk_count = col.count()
+            doc_count = 0
+            if chunk_count:
+                metas = col.get(include=["metadatas"]).get("metadatas", [])
+                doc_count = len({m.get("source") for m in metas if m.get("source")})
+            result.append({"name": name, "document_count": doc_count, "chunk_count": chunk_count})
         except Exception:
-            result.append({"name": name, "document_count": 0})
+            result.append({"name": name, "document_count": 0, "chunk_count": 0})
     return result
 
 
 def delete_collection(name: str):
     client = get_chroma_client()
     client.delete_collection(name)
-    logger.info(f"Deleted collection {name}")
+    _bm25_cache.pop(name, None)
+    # Clear stored content hashes, otherwise a reindex would dedup-skip every
+    # file as "unchanged" and leave the rebuilt collection empty.
+    from app.config import atomic_update
+
+    def _clear(config):
+        config.get("content_hashes", {}).pop(name, None)
+    atomic_update(_clear)
+    logger.info("Deleted collection %s", name)

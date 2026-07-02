@@ -13,8 +13,14 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir "torch>=2.7.0" --index-url https://download.pytorch.org/whl/${TORCH_VARIANT} \
     && pip install --no-cache-dir -r requirements.txt
 
-# Pre-download the embedding model
-RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
+# Pre-download models so first query doesn't block
+RUN python -c "\
+from sentence_transformers import SentenceTransformer, CrossEncoder; \
+SentenceTransformer('all-MiniLM-L6-v2'); \
+CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')"
+
+# Pre-download Docling layout/table models so first PDF upload doesn't block
+RUN python -c "from docling.utils.model_downloader import download_models; download_models()"
 
 COPY . .
 

@@ -139,7 +139,26 @@ function LoginForm({ onDone }) {
 export default function App() {
   const [activePage, setActivePage] = useState('dashboard')
   const [authState, setAuthState] = useState('checking')
+  const [theme, setTheme] = useState(localStorage.getItem('rmcp_theme') || 'dark')
   const PageComponent = PAGE_COMPONENTS[activePage]
+
+  useEffect(() => {
+    document.body.className = theme === 'light' ? 'light' : ''
+    localStorage.setItem('rmcp_theme', theme)
+  }, [theme])
+
+  // Keyboard shortcuts
+  useEffect(() => {
+    function handleKey(e) {
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return
+      if (e.key === '/' && !e.ctrlKey) { e.preventDefault(); setActivePage('search') }
+      if (e.key === 'd' && !e.ctrlKey && !e.metaKey) setActivePage('dashboard')
+      if (e.key === 'k' && !e.ctrlKey) setActivePage('apikeys')
+      if (e.key === 'Escape') document.activeElement?.blur()
+    }
+    window.addEventListener('keydown', handleKey)
+    return () => window.removeEventListener('keydown', handleKey)
+  }, [])
 
   useEffect(() => { evaluateAuth() }, [])
 
@@ -195,10 +214,16 @@ export default function App() {
             {page.label}
           </button>
         ))}
-        <button className="nav-item" onClick={signOut} style={{ marginTop: 'auto' }}>
-          <span style={{ fontFamily: 'monospace', width: '1.2em', textAlign: 'center' }}>X</span>
-          Sign out
-        </button>
+        <div style={{ marginTop: 'auto', display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
+          <button className="nav-item" onClick={() => setTheme(t => t === 'dark' ? 'light' : 'dark')}>
+            <span style={{ fontFamily: 'monospace', width: '1.2em', textAlign: 'center' }}>{theme === 'dark' ? 'L' : 'D'}</span>
+            {theme === 'dark' ? 'Light mode' : 'Dark mode'}
+          </button>
+          <button className="nav-item" onClick={signOut}>
+            <span style={{ fontFamily: 'monospace', width: '1.2em', textAlign: 'center' }}>X</span>
+            Sign out
+          </button>
+        </div>
       </nav>
       <main className="main-content">
         <PageComponent />

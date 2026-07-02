@@ -8,9 +8,8 @@
 #   - nvidia-container-toolkit / runtime available to Docker
 #   - Verify with: nvidia-smi   (should list the 5070)
 #
-# This rebuilds the backend with a CUDA-enabled torch and reserves the GPU
-# for the backend container, which runs the sentence-transformers embedding
-# model on the GPU. The CPU-only path (plain docker-compose.yml) is unchanged.
+# This rebuilds the backend with CUDA-enabled torch, adds an Ollama service
+# for local LLM answer generation, and reserves the GPU for both.
 
 services:
   backend:
@@ -19,12 +18,56 @@ services:
         TORCH_VARIANT: cu128   # CUDA 12.8 — required for Blackwell/sm_120 (5070)
     environment:
       - EMBEDDING_DEVICE=cuda
+      - LLM_URL=http://ollama:11434
+      - LLM_MODEL=${LLM_MODEL:-qwen2.5:14b}
+      - ENABLE_HYDE=1   # local LLM is present on GPU deploys, so HyDE is worthwhile
+      # Contextual retrieval enriches chunks at ingest via the LLM (big retrieval
+      # win, slower ingestion). Off by default; set to 1 to enable.
+      - ENABLE_CONTEXTUAL_INGEST=${ENABLE_CONTEXTUAL_INGEST:-0}
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    depends_on:
+      ollama:
+        condition: service_healthy
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              count: all
               capabilities: [gpu]
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: rag-mcp-ollama
+    restart: unless-stopped
+    # Serve, then pull the model in the background (idempotent — a no-op once cached).
+    entrypoint: ["/bin/sh", "-c", "ollama serve & sleep 5; ollama pull ${LLM_MODEL:-qwen2.5:14b}; wait"]
+    # Ollama has NO authentication. The backend reaches it over the internal
+    # compose network, so no host port is needed. Uncomment only if other LAN
+    # apps must use this Ollama directly — anyone on the LAN could then run
+    # prompts or delete/pull models.
+    # ports:
+    #   - "11434:11434"
+    volumes:
+      - ./data/ollama:/root/.ollama
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 30s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+        limits:
+          memory: 14G
+    networks:
+      - rag-network

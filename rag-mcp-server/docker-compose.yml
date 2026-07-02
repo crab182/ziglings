@@ -11,6 +11,9 @@ services:
       - ./data/documents:/app/data/documents
       - ./data/chromadb:/app/data/chromadb
       - ./data/config:/app/data/config
+      # Optional: mount the Unraid host notify script to enable system
+      # notifications on sync complete/failed (safe to leave commented out).
+      # - /usr/local/emhttp/webGui/scripts/notify:/usr/local/bin/unraid-notify:ro
     environment:
       - CHROMA_PERSIST_DIR=/app/data/chromadb
       - DOCUMENTS_DIR=/app/data/documents
@@ -19,10 +22,16 @@ services:
       - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-http://192.168.1.52:8902,http://localhost:8902,https://192.168.1.52:8943,https://localhost:8943}
     security_opt:
       - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 120s
     deploy:
       resources:
         limits:
-          memory: 4G
+          memory: 6G
     networks:
       - rag-network
 
@@ -41,11 +50,20 @@ services:
       - CONFIG_DIR=/app/data/config
       - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-http://192.168.1.52:8902,http://localhost:8902,https://192.168.1.52:8943,https://localhost:8943}
       - ALLOWED_HOSTS=${ALLOWED_HOSTS:-192.168.1.52:8901,192.168.1.52:8902,192.168.1.52:8943,localhost:8901,localhost:8902,localhost:8943,mcp-server:8001}
+      # Optional override. If unset, the MCP server uses the service key the
+      # backend auto-provisions to the shared config volume (data/config/mcp_service.key).
       - MCP_BACKEND_KEY=${MCP_BACKEND_KEY:-}
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     security_opt:
       - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8001/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     deploy:
       resources:
         limits:
@@ -65,10 +83,18 @@ services:
     volumes:
       - ./data/certs:/etc/nginx/certs:ro
     depends_on:
-      - backend
-      - mcp-server
+      backend:
+        condition: service_healthy
+      mcp-server:
+        condition: service_started
     security_opt:
       - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:80/"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     deploy:
       resources:
         limits:

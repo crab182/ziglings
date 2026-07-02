@@ -1,7 +1,10 @@
+import asyncio
+import json
 import logging
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
 
 from app.config import settings
 from app.models.schemas import IngestTextRequest, QueryRequest
@@ -39,7 +42,8 @@ async def upload_document(
     if not content:
         raise HTTPException(400, "Empty file")
 
-    text = parse_file(content=content, filename=filename)
+    # Parsing (Docling) and embedding are CPU-heavy — keep them off the event loop.
+    text = await asyncio.to_thread(parse_file, content=content, filename=filename)
     if not text.strip():
         raise HTTPException(400, "Could not extract text from file")
 
@@ -50,13 +54,19 @@ async def upload_document(
     save_path = safe_join(save_dir, filename)
     save_path.write_bytes(content)
 
-    chunks = rag_engine.ingest_text(text, source=filename, collection_name=collection)
+    chunks = await asyncio.to_thread(
+        rag_engine.ingest_text, text, source=filename, collection_name=collection
+    )
     return {"filename": filename, "collection": collection, "chunks_created": chunks}
 
 
 @router.post("/query")
 async def query_documents(req: QueryRequest, _: dict = Depends(require_api_key)):
-    results = rag_engine.query(req.query, collection_name=req.collection, n_results=req.n_results)
+    # query() is CPU-bound (embedding/BM25/rerank) and may do a network call
+    # for HyDE — run it off the event loop so SSE/MCP stay responsive.
+    results = await asyncio.to_thread(
+        rag_engine.query, req.query, collection_name=req.collection, n_results=req.n_results
+    )
     return {"results": results, "query": req.query}
 
 
@@ -106,9 +116,11 @@ async def reindex_collection(collection: str = "default", _: dict = Depends(requ
             safe_join(doc_dir, file_path.name)
         except HTTPException:
             continue
-        text = parse_file(file_path=str(file_path))
+        text = await asyncio.to_thread(parse_file, file_path=str(file_path))
         if text.strip():
-            chunks = rag_engine.ingest_text(text, source=file_path.name, collection_name=collection)
+            chunks = await asyncio.to_thread(
+                rag_engine.ingest_text, text, source=file_path.name, collection_name=collection
+            )
             total_chunks += chunks
             files_processed += 1
 
@@ -174,3 +186,85 @@ async def ingest_text(req: IngestTextRequest, _: dict = Depends(require_admin_ke
     safe_source = safe_filename(req.source)
     chunks = rag_engine.ingest_text(req.text, source=safe_source, collection_name=req.collection)
     return {"source": safe_source, "collection": req.collection, "chunks_created": chunks}
+
+
+def _build_sources(results: list[dict]) -> list[dict]:
+    sources = []
+    for r in results:
+        s = {"source": r["source"], "score": r["score"], "excerpt": r["content"][:200]}
+        if r.get("metadata", {}).get("page_number"):
+            s["page"] = r["metadata"]["page_number"]
+        if r.get("metadata", {}).get("section_header"):
+            s["section"] = r["metadata"]["section_header"]
+        sources.append(s)
+    return sources
+
+
+def _llm_chunks(results: list[dict]) -> list[dict]:
+    """Feed the LLM expanded context when available; UI sources keep the raw chunk."""
+    return [{**r, "content": r.get("expanded_content") or r["content"]} for r in results]
+
+
+@router.post("/ask")
+async def ask_documents(req: QueryRequest, _: dict = Depends(require_api_key)):
+    """Search + generate an answer using a local LLM (Ollama). Falls back to search-only."""
+    validate_collection_name(req.collection)
+    results = await asyncio.to_thread(
+        rag_engine.query, req.query, collection_name=req.collection, n_results=req.n_results
+    )
+
+    try:
+        from app.services.llm import generate_answer
+        llm_result = await generate_answer(req.query, _llm_chunks(results))
+    except Exception:
+        logger.exception("LLM answer generation failed")
+        llm_result = {"answer": "", "model": ""}
+
+    return {
+        "answer": llm_result.get("answer", ""),
+        "model": llm_result.get("model", ""),
+        "query": req.query,
+        "sources": _build_sources(results),
+    }
+
+
+@router.post("/ask/stream")
+async def ask_documents_stream(req: QueryRequest, _: dict = Depends(require_api_key)):
+    """Streaming variant of /ask. SSE events: sources -> delta* -> done.
+    All data payloads are JSON-encoded (raw newlines would break SSE framing)."""
+    validate_collection_name(req.collection)
+
+    def sse(event: str, data) -> str:
+        return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+    async def gen():
+        # Retrieval runs inside the generator so response headers flush
+        # immediately and the client sees the stream open.
+        try:
+            results = await asyncio.to_thread(
+                rag_engine.query, req.query,
+                collection_name=req.collection, n_results=req.n_results,
+            )
+        except Exception:
+            logger.exception("Retrieval failed in /ask/stream")
+            yield sse("error", {"detail": "Retrieval failed"})
+            return
+
+        yield sse("sources", _build_sources(results))
+
+        streamed = False
+        try:
+            from app.services.llm import LLM_MODEL, generate_answer_stream
+            async for delta in generate_answer_stream(req.query, _llm_chunks(results)):
+                streamed = True
+                yield sse("delta", {"text": delta})
+            yield sse("done", {"model": LLM_MODEL if streamed else ""})
+        except Exception:
+            logger.exception("LLM stream failed in /ask/stream")
+            yield sse("done", {"model": ""})
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )

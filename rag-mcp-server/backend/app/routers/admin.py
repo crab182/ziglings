@@ -29,7 +29,10 @@ async def get_status(_: dict = Depends(require_api_key)):
         "mcp_enabled": config.get("mcp_enabled", True),
         "total_documents": total_docs,
         "collections": collection_names,
-        "api_keys_count": len([k for k in config.get("api_keys", []) if k.get("active", True)]),
+        "active_credentials": len([
+            k for k in config.get("api_keys", [])
+            if k.get("active", True) and k.get("name") != auth.SERVICE_KEY_NAME
+        ]),
     }
 
 
@@ -93,7 +96,10 @@ async def get_config(_: dict = Depends(require_admin_key)):
             "active": k.get("active", True),
         }
         for k in config.get("api_keys", [])
+        if k.get("name") != auth.SERVICE_KEY_NAME
     ]
+    # Never expose internal key-management state
+    safe_config.pop("content_hashes", None)
     if "smb_shares" in safe_config:
         safe_config["smb_shares"] = [
             {k: v for k, v in s.items() if k not in ("password", "encrypted_password")}
@@ -110,3 +116,16 @@ async def bootstrap_required():
     except Exception:
         logger.exception("Failed to check bootstrap status")
         return {"bootstrap_required": True}
+
+
+@router.get("/metrics")
+async def get_metrics(_: dict = Depends(require_admin_key)):
+    """Performance metrics: query/ingest counts and average latencies."""
+    m = rag_engine.get_metrics()
+    qc = m.get("query_count", 0)
+    return {
+        "query_count": qc,
+        "ingest_count": m.get("ingest_count", 0),
+        "avg_retrieve_ms": round(m.get("total_retrieve_ms", 0) / qc, 1) if qc else 0,
+        "avg_rerank_ms": round(m.get("total_rerank_ms", 0) / qc, 1) if qc else 0,
+    }

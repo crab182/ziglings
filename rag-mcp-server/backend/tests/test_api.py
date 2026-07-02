@@ -239,6 +239,41 @@ def run():
     check("path-traversal filename handled", r.status_code in (200, 400),
           f"{r.status_code}: {r.text[:150]}")
 
+    # Internal MCP service key: auto-provisioned, excluded from UX, protected
+    from app.services import auth
+    svc_raw = auth.ensure_service_key()
+    check("service key provisioned", svc_raw.startswith("rmcp_"))
+    check("service key validates as admin",
+          (auth.validate_api_key(svc_raw) or {}).get("is_admin") is True)
+    check("service key hidden from list",
+          all(k["name"] != auth.SERVICE_KEY_NAME for k in auth.list_api_keys()))
+    check("service key not deletable", auth.delete_api_key(auth.SERVICE_KEY_NAME) is False)
+    check("ensure_service_key idempotent", auth.ensure_service_key() == svc_raw)
+
+    # Streaming ask endpoint: emits SSE, starts with a sources event, ends with done.
+    r = client.post("/api/documents/ask/stream", headers=hdr,
+                    json={"query": "hello", "collection": "default", "n_results": 3})
+    check("ask/stream 200", r.status_code == 200, f"{r.status_code}: {r.text[:150]}")
+    ctype = r.headers.get("content-type", "")
+    check("ask/stream is event-stream", "text/event-stream" in ctype, ctype)
+    body = r.text
+    check("ask/stream emits sources event", "event: sources" in body, body[:200])
+    check("ask/stream emits done event", "event: done" in body, body[:200])
+
+    # list_collections exposes both chunk_count and document_count
+    r = client.get("/api/documents/collections", headers=hdr)
+    cols = r.json().get("collections", [])
+    check("collections expose chunk_count + document_count",
+          all("chunk_count" in c and "document_count" in c for c in cols) if cols else True,
+          str(cols)[:200])
+
+    # Citations instruction present in the LLM prompt builder
+    from app.services.llm import _build_messages
+    msgs = _build_messages("q", [{"content": "c", "source": "s", "metadata": {}}])
+    check("citations instruction in system prompt",
+          "[1]" in msgs[0]["content"] and "context blocks" in msgs[0]["content"].lower(),
+          msgs[0]["content"][:120])
+
     print("\n" + "=" * 50)
     print(f"RESULT: {len(_failures)} failure(s)")
     for n, d in _failures:

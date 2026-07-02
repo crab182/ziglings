@@ -15,6 +15,22 @@
   --radius: 8px;
 }
 
+body.light {
+  --bg-primary: #f8fafc;
+  --bg-secondary: #ffffff;
+  --bg-card: #ffffff;
+  --bg-input: #f1f5f9;
+  --text-primary: #0f172a;
+  --text-secondary: #475569;
+  --text-muted: #94a3b8;
+  --accent: #2563eb;
+  --accent-hover: #1d4ed8;
+  --success: #16a34a;
+  --warning: #d97706;
+  --danger: #dc2626;
+  --border: #e2e8f0;
+}
+
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
 body {
@@ -883,3 +899,124 @@ body {
   color: var(--accent);
   font-size: 0.8rem;
 }
+
+/* Citation badges */
+.citation-badge {
+  display: inline-block;
+  background: var(--bg-input);
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.15rem 0.4rem;
+  font-size: 0.75rem;
+  margin-left: 0.3rem;
+  cursor: default;
+}
+
+.citation-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  margin-top: 0.5rem;
+}
+
+.citation-list .citation-badge:hover {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+
+/* Answer block */
+.answer-block {
+  background: var(--bg-input);
+  border-left: 3px solid var(--accent);
+  padding: 1rem;
+  border-radius: 0 var(--radius) var(--radius) 0;
+  line-height: 1.7;
+}
+
+/* Metrics display */
+.metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 0.75rem;
+  margin-top: 0.5rem;
+}
+
+.metric-item {
+  background: var(--bg-input);
+  border-radius: var(--radius);
+  padding: 0.6rem;
+  text-align: center;
+}
+
+.metric-item .label { font-size: 0.75rem; color: var(--text-muted); }
+.metric-item .value { font-size: 1.1rem; font-weight: 600; }
+
+/* Inline citation markers */
+.cite-marker {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 3px;
+  font-size: 0.65rem;
+  line-height: 1;
+  padding: 1px 4px;
+  margin: 0 1px;
+  cursor: pointer;
+}
+.cite-marker:hover { background: var(--accent-hover); }
+
+.citation-badge.clickable { cursor: pointer; }
+.citation-badge.clickable:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
+.citation-badge.cite-active { background: var(--warning); color: #000; border-color: var(--warning); }
+
+/* Streaming cursor */
+.stream-cursor { animation: blink 1s step-start infinite; color: var(--accent); }
+@keyframes blink { 50% { opacity: 0; } }
+
+/* Link-style button */
+.link-btn {
+  background: none;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  padding: 0;
+  font-size: inherit;
+  text-align: left;
+}
+.link-btn:hover { text-decoration: underline; }
+
+/* Upload queue */
+.upload-queue { margin-top: 1rem; display: flex; flex-direction: column; gap: 0.4rem; }
+.upload-row { display: flex; align-items: center; gap: 0.6rem; font-size: 0.85rem; }
+.upload-name { flex: 0 0 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.upload-bar { flex: 1; height: 6px; background: var(--bg-input); border-radius: 3px; overflow: hidden; }
+.upload-bar-fill { height: 100%; background: var(--accent); transition: width 0.2s; }
+.upload-bar-fill.status-done { background: var(--success); }
+.upload-bar-fill.status-failed { background: var(--danger); }
+.upload-status { flex: 0 0 auto; color: var(--text-muted); min-width: 90px; }
+.upload-status.status-done { color: var(--success); }
+.upload-status.status-failed { color: var(--danger); }
+
+/* Document preview modal */
+.modal-backdrop {
+  position: fixed; inset: 0; background: rgba(0,0,0,0.6);
+  display: flex; align-items: center; justify-content: center; z-index: 100; padding: 2rem;
+}
+.modal {
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius);
+  width: 100%; max-width: 820px; max-height: 85vh; display: flex; flex-direction: column;
+}
+.modal-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 1rem 1.25rem; border-bottom: 1px solid var(--border);
+}
+.modal-header h3 { margin: 0; word-break: break-all; }
+.modal-close { background: none; border: none; color: var(--text-secondary); font-size: 1.5rem; cursor: pointer; line-height: 1; }
+.modal-body { padding: 1.25rem; overflow-y: auto; }
+.doc-content {
+  white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, SFMono-Regular, monospace;
+  font-size: 0.82rem; line-height: 1.5; color: var(--text-primary);
+}
+.doc-content mark { background: var(--warning); color: #000; }

@@ -29,8 +29,23 @@ CONFIG_DIR = os.environ.get("CONFIG_DIR", "/app/data/config")
 CONFIG_FILE = Path(CONFIG_DIR) / "server_config.json"
 
 # Server-issued credential for backend calls (spec forbids forwarding client tokens).
-# Set MCP_BACKEND_KEY to a dedicated admin key created for the MCP service.
+# Prefer an explicit MCP_BACKEND_KEY env var; otherwise fall back to the
+# auto-provisioned service key the backend writes to the shared config volume.
 MCP_BACKEND_KEY = os.environ.get("MCP_BACKEND_KEY", "")
+SERVICE_KEY_FILE = Path(CONFIG_DIR) / "mcp_service.key"
+
+
+def _backend_headers() -> dict:
+    """Build the Authorization header for backend calls. Reads the auto-provisioned
+    service key fresh so backend key rotation/regeneration is picked up."""
+    key = MCP_BACKEND_KEY
+    if not key:
+        try:
+            if SERVICE_KEY_FILE.exists():
+                key = SERVICE_KEY_FILE.read_text().strip()
+        except Exception:
+            key = ""
+    return {"Authorization": f"Bearer {key}"} if key else {}
 
 CORS_ORIGINS = [o.strip() for o in os.environ.get("CORS_ALLOWED_ORIGINS", "http://192.168.1.52:8902,http://localhost:8902,https://192.168.1.52:8943,https://localhost:8943").split(",") if o.strip()]
 ALLOWED_HOSTS = {h.strip() for h in os.environ.get("ALLOWED_HOSTS", "192.168.1.52:8901,192.168.1.52:8902,192.168.1.52:8943,localhost:8901,localhost:8902,localhost:8943,mcp-server:8001").split(",") if h.strip()}
@@ -110,10 +125,15 @@ def check_origin(request: Request) -> None:
 
 # --- MCP Protocol Implementation ---
 
+# Cap for document content returned through any MCP path (get_document tool
+# and resources/read) — protects clients from unbounded payloads.
+MAX_DOCUMENT_CHARS = 100_000
+
 SERVER_INFO = {"name": "rag-document-server", "version": "1.0.0"}
 SERVER_CAPABILITIES = {
     "tools": {"listChanged": False},
     "resources": {"subscribe": False, "listChanged": False},
+    "prompts": {"listChanged": False},
 }
 
 TOOLS = [
@@ -176,6 +196,19 @@ TOOLS = [
         },
     },
     {
+        "name": "ask_documents",
+        "description": "Search documents and generate an answer using the local LLM. Returns a generated answer with cited sources. Falls back to search-only if no LLM is available.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "The question to answer from the documents"},
+                "collection": {"type": "string", "description": "Collection to search (default: 'default')", "default": "default"},
+                "n_results": {"type": "integer", "description": "Number of source chunks to use (default: 5)", "default": 5},
+            },
+            "required": ["query"],
+        },
+    },
+    {
         "name": "list_agents",
         "description": "List all deployed AI agents on the server with their current status, type, and last heartbeat time.",
         "inputSchema": {"type": "object", "properties": {}},
@@ -217,17 +250,41 @@ TOOLS = [
             "required": ["agent_id"],
         },
     },
+    {
+        "name": "create_collection",
+        "description": "Create a new document collection. Requires an admin-tier API key.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Collection name (1-64 chars: letters, digits, '_' or '-')"},
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "delete_collection",
+        "description": "Delete a document collection and all its indexed chunks. The 'default' collection cannot be deleted. Requires an admin-tier API key.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Collection name to delete"},
+            },
+            "required": ["name"],
+        },
+    },
 ]
 
 
-ADMIN_TOOLS = {"ingest_note", "submit_agent_task", "get_agent_tasks"}
+ADMIN_TOOLS = {"ingest_note", "submit_agent_task", "get_agent_tasks", "create_collection", "delete_collection"}
+
+# Mirrors backend validate_collection_name
 
 
 async def handle_tool_call(name: str, arguments: dict, caller_is_admin: bool) -> dict:
     if name in ADMIN_TOOLS and not caller_is_admin:
         return {"content": [{"type": "text", "text": "Permission denied: admin API key required"}], "isError": True}
     # Use the MCP server's own credential — never forward the client's token.
-    headers = {"Authorization": f"Bearer {MCP_BACKEND_KEY}"} if MCP_BACKEND_KEY else {}
+    headers = _backend_headers()
     async with httpx.AsyncClient(base_url=BACKEND_URL, timeout=60.0, headers=headers) as client:
         if name == "search_documents":
             resp = await client.post("/api/documents/query", json={
@@ -292,7 +349,7 @@ async def handle_tool_call(name: str, arguments: dict, caller_is_admin: bool) ->
                 f"**MCP Enabled:** {data['mcp_enabled']}\n"
                 f"**Total Documents:** {data['total_documents']}\n"
                 f"**Collections:** {', '.join(data['collections']) or 'none'}\n"
-                f"**Active API Keys:** {data['api_keys_count']}"
+                f"**Active API Keys:** {data['active_credentials']}"
             )
             return {
                 "content": [
@@ -311,9 +368,8 @@ async def handle_tool_call(name: str, arguments: dict, caller_is_admin: bool) ->
             resp.raise_for_status()
             data = resp.json()
             content = data.get("content", "")
-            MAX_CHARS = 100_000
-            if len(content) > MAX_CHARS:
-                content = content[:MAX_CHARS] + f"\n\n[Truncated — full document is {len(data['content'])} characters across {data['chunk_count']} chunks]"
+            if len(content) > MAX_DOCUMENT_CHARS:
+                content = content[:MAX_DOCUMENT_CHARS] + f"\n\n[Truncated — full document is {len(data['content'])} characters across {data['chunk_count']} chunks]"
             text = f"**Source:** {data['source']} ({data['chunk_count']} chunks)\n**Collection:** {data['collection']}\n\n{content}"
             return {"content": [{"type": "text", "text": text}], "isError": False}
 
@@ -376,6 +432,26 @@ async def handle_tool_call(name: str, arguments: dict, caller_is_admin: bool) ->
         return {"content": [{"type": "text", "text": f"Unknown tool: {name}"}], "isError": True}
 
 
+# Client-side collection-name guard: httpx normalizes `..` path segments, so an
+# unvalidated name interpolated into the URL could redirect a request to a backend
+# admin endpoint (api-keys, mcp/toggle) carrying the server's admin MCP_BACKEND_KEY.
+# Validate before making ANY HTTP call.
+_COLLECTION_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _reject_bad_name(name: str):
+    """Return an isError tool result if the collection name is invalid, else None."""
+    if not _COLLECTION_NAME_RE.match(name or ""):
+        return {
+            "content": [{
+                "type": "text",
+                "text": "Collection name must be 1-64 characters: letters, digits, '_' or '-'.",
+            }],
+            "isError": True,
+        }
+    return None
+
+
 def _detail(resp) -> str:
     """Extract FastAPI's {'detail': ...} message, falling back to status text."""
     try:
@@ -406,7 +482,52 @@ def handle_jsonrpc(request_body: dict) -> dict | None:
     elif method == "tools/call":
         return {"_async_tool_call": True, "id": req_id, "params": params}
     elif method == "resources/list":
-        return {"jsonrpc": "2.0", "id": req_id, "result": {"resources": []}}
+        return {"_async_resource_list": True, "id": req_id}
+    elif method == "resources/read":
+        return {"_async_resource_read": True, "id": req_id, "params": params}
+    elif method == "resources/templates/list":
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "resourceTemplates": [
+                    {
+                        "uriTemplate": "rag://collections/{collection}/documents/{source}",
+                        "name": "RAG Document",
+                        "description": "Full content of a document in a collection",
+                        "mimeType": "text/plain",
+                    },
+                ],
+            },
+        }
+    elif method == "prompts/list":
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "prompts": [
+                    {
+                        "name": "summarize_document",
+                        "description": "Summarize a specific document from the RAG",
+                        "arguments": [
+                            {"name": "source", "description": "Document source name", "required": True},
+                            {"name": "collection", "description": "Collection name", "required": False},
+                        ],
+                    },
+                    {
+                        "name": "compare_documents",
+                        "description": "Compare two documents from the RAG",
+                        "arguments": [
+                            {"name": "source_a", "description": "First document source", "required": True},
+                            {"name": "source_b", "description": "Second document source", "required": True},
+                            {"name": "collection", "description": "Collection name", "required": False},
+                        ],
+                    },
+                ],
+            },
+        }
+    elif method == "prompts/get":
+        return {"_async_prompt_get": True, "id": req_id, "params": params}
     elif method == "ping":
         return {"jsonrpc": "2.0", "id": req_id, "result": {}}
     return {
@@ -414,6 +535,93 @@ def handle_jsonrpc(request_body: dict) -> dict | None:
         "id": req_id,
         "error": {"code": -32601, "message": f"Method not found: {method}"},
     }
+
+
+async def _handle_async_jsonrpc(result: dict, caller_is_admin: bool) -> dict:
+    """Handle async JSON-RPC calls (tools, resources, prompts)."""
+    headers = _backend_headers()
+    async with httpx.AsyncClient(base_url=BACKEND_URL, timeout=60.0, headers=headers) as client:
+        if result.get("_async_tool_call"):
+            params = result["params"]
+            tool_name = params.get("name", "")
+            tool_args = params.get("arguments", {})
+            try:
+                tool_result = await handle_tool_call(tool_name, tool_args, caller_is_admin)
+            except Exception:
+                logger.exception("Tool call failed: %s", tool_name)
+                tool_result = {"content": [{"type": "text", "text": "Tool execution failed"}], "isError": True}
+            return {"jsonrpc": "2.0", "id": result["id"], "result": tool_result}
+
+        elif result.get("_async_resource_list"):
+            try:
+                resp = await client.get("/api/documents/collections")
+                resp.raise_for_status()
+                collections = resp.json().get("collections", [])
+                resources = []
+                for col in collections:
+                    resp2 = await client.get("/api/documents/list", params={"collection": col["name"]})
+                    if resp2.status_code == 200:
+                        for doc in resp2.json().get("documents", []):
+                            resources.append({
+                                "uri": f"rag://collections/{col['name']}/documents/{doc}",
+                                "name": doc,
+                                "description": f"Document in collection '{col['name']}'",
+                                "mimeType": "text/plain",
+                            })
+                return {"jsonrpc": "2.0", "id": result["id"], "result": {"resources": resources}}
+            except Exception:
+                logger.exception("Resource list failed")
+                return {"jsonrpc": "2.0", "id": result["id"], "result": {"resources": []}}
+
+        elif result.get("_async_resource_read"):
+            uri = result["params"].get("uri", "")
+            import re
+            m = re.match(r"rag://collections/([^/]+)/documents/(.+)", uri)
+            if not m:
+                return {"jsonrpc": "2.0", "id": result["id"], "error": {"code": -32602, "message": f"Invalid resource URI: {uri}"}}
+            collection, source = m.group(1), m.group(2)
+            try:
+                resp = await client.get("/api/documents/content", params={"source": source, "collection": collection})
+                if resp.status_code == 404:
+                    return {"jsonrpc": "2.0", "id": result["id"], "error": {"code": -32602, "message": "Document not found"}}
+                resp.raise_for_status()
+                data = resp.json()
+                text = data.get("content", "")
+                # Same cap as the get_document tool — an authenticated client must
+                # not be able to force unbounded allocation through resources/read.
+                if len(text) > MAX_DOCUMENT_CHARS:
+                    text = text[:MAX_DOCUMENT_CHARS] + (
+                        f"\n\n[Truncated — full document is {len(data.get('content', ''))} characters "
+                        f"across {data.get('chunk_count', '?')} chunks]"
+                    )
+                return {"jsonrpc": "2.0", "id": result["id"], "result": {
+                    "contents": [{"uri": uri, "mimeType": "text/plain", "text": text}],
+                }}
+            except Exception:
+                logger.exception("Resource read failed: %s", uri)
+                return {"jsonrpc": "2.0", "id": result["id"], "error": {"code": -32603, "message": "Resource read failed"}}
+
+        elif result.get("_async_prompt_get"):
+            name = result["params"].get("name", "")
+            args = result["params"].get("arguments", {})
+            collection = args.get("collection", "default")
+            if name == "summarize_document":
+                source = args.get("source", "")
+                return {"jsonrpc": "2.0", "id": result["id"], "result": {
+                    "messages": [
+                        {"role": "user", "content": {"type": "text", "text": f"Please summarize the following document from collection '{collection}': {source}\n\nUse the search_documents or get_document tool to retrieve its content, then provide a clear, structured summary."}},
+                    ],
+                }}
+            elif name == "compare_documents":
+                a, b = args.get("source_a", ""), args.get("source_b", "")
+                return {"jsonrpc": "2.0", "id": result["id"], "result": {
+                    "messages": [
+                        {"role": "user", "content": {"type": "text", "text": f"Compare these two documents from collection '{collection}':\n1. {a}\n2. {b}\n\nUse get_document to retrieve both, then provide a structured comparison of their content, similarities, and differences."}},
+                    ],
+                }}
+            return {"jsonrpc": "2.0", "id": result["id"], "error": {"code": -32602, "message": f"Unknown prompt: {name}"}}
+
+    return {"jsonrpc": "2.0", "id": result["id"], "error": {"code": -32603, "message": "Unhandled async call"}}
 
 
 # --- HTTP + SSE Transport ---
@@ -465,16 +673,9 @@ async def handle_message(
     if result is None:
         return {"status": "ok"}
 
-    if result.get("_async_tool_call"):
-        params = result["params"]
-        tool_name = params.get("name", "")
-        tool_args = params.get("arguments", {})
-        try:
-            tool_result = await handle_tool_call(tool_name, tool_args, caller.get("is_admin", False))
-        except Exception:
-            logger.exception("Tool call failed: %s", tool_name)
-            tool_result = {"content": [{"type": "text", "text": "Tool execution failed"}], "isError": True}
-        response = {"jsonrpc": "2.0", "id": result["id"], "result": tool_result}
+    is_async = any(result.get(k) for k in ("_async_tool_call", "_async_resource_list", "_async_resource_read", "_async_prompt_get"))
+    if is_async:
+        response = await _handle_async_jsonrpc(result, caller.get("is_admin", False))
     else:
         response = result
 
@@ -498,16 +699,9 @@ async def mcp_streamable(request: Request, authorization: str | None = Header(No
     if result is None:
         return Response(status_code=204)
 
-    if result.get("_async_tool_call"):
-        params = result["params"]
-        tool_name = params.get("name", "")
-        tool_args = params.get("arguments", {})
-        try:
-            tool_result = await handle_tool_call(tool_name, tool_args, caller.get("is_admin", False))
-        except Exception:
-            logger.exception("Tool call failed: %s", tool_name)
-            tool_result = {"content": [{"type": "text", "text": "Tool execution failed"}], "isError": True}
-        return {"jsonrpc": "2.0", "id": result["id"], "result": tool_result}
+    is_async = any(result.get(k) for k in ("_async_tool_call", "_async_resource_list", "_async_resource_read", "_async_prompt_get"))
+    if is_async:
+        return await _handle_async_jsonrpc(result, caller.get("is_admin", False))
 
     return result
 
@@ -524,7 +718,23 @@ async def mcp_info():
         "name": SERVER_INFO["name"],
         "version": SERVER_INFO["version"],
         "protocol_version": "2024-11-05",
+        "capabilities": ["tools", "resources", "prompts"],
         "tools": [{"name": t["name"], "description": t["description"]} for t in TOOLS],
+        "prompts": ["summarize_document", "compare_documents"],
+        "resources": "rag://collections/{collection}/documents/{source}",
         "transports": ["sse", "streamable-http"],
         "auth": "Bearer token (API key)",
+    }
+
+
+@app.get("/.well-known/mcp")
+async def well_known_mcp():
+    """Discovery server card (SEP-1649 style)."""
+    return {
+        "name": SERVER_INFO["name"],
+        "version": SERVER_INFO["version"],
+        "protocolVersion": "2024-11-05",
+        "capabilities": list(SERVER_CAPABILITIES.keys()),
+        "endpoints": {"sse": "/sse", "streamableHttp": "/mcp"},
+        "authentication": {"type": "bearer", "description": "API key as Bearer token"},
     }
