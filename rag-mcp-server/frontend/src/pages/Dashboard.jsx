@@ -1,15 +1,17 @@
 import React, { useState, useEffect } from 'react'
-import { getStatus, getMetrics } from '../services/api'
+import { getStatus, getMetrics, getMcpInfo } from '../services/api'
 import HelpBubble from '../components/HelpBubble'
 
 export default function Dashboard() {
   const [status, setStatus] = useState(null)
   const [metrics, setMetrics] = useState(null)
+  const [mcp, setMcp] = useState(null)
   const [error, setError] = useState(null)
 
   useEffect(() => {
     getStatus().then(setStatus).catch(e => setError(e.message))
     getMetrics().then(setMetrics).catch(() => {})
+    getMcpInfo().then(setMcp).catch(() => {})
   }, [])
 
   if (error) return <div className="alert alert-error">{error}</div>
@@ -110,8 +112,18 @@ export default function Dashboard() {
           <label>Server Info</label>
           <div className="code-block">https://{status.ip}:8943/mcp/info</div>
         </div>
+        {mcp && (
+          <div className="form-group">
+            <label>Capabilities</label>
+            <div className="citation-list">
+              {(mcp.capabilities || []).map(c => <span key={c} className="citation-badge">{c}</span>)}
+              {mcp.tools && <span className="citation-badge">{mcp.tools.length} tools</span>}
+              {mcp.prompts && <span className="citation-badge">{mcp.prompts.length} prompts</span>}
+            </div>
+          </div>
+        )}
         <p style={{ color: 'var(--text-muted)', fontSize: '0.8rem', marginTop: '0.5rem' }}>
-          Use your API key as a Bearer token in the Authorization header. 7 tools available.
+          Use your API key as a Bearer token in the Authorization header.
         </p>
       </div>
     </div>

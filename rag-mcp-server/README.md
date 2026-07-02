@@ -206,3 +206,68 @@ ML dependencies — no GPU or vector DB required:
 cd backend
 python tests/test_api.py        # exits non-zero on any failure
 ```
+
+```bash
+python tests/test_eval.py       # retrieval golden-set (top-1 ranking)
+```
+
+## Retrieval pipeline
+
+Ingestion: files are parsed (PDFs via **Docling** — layout/table-aware Markdown
+with `<!-- page N -->` markers, falling back to pypdf), chunked
+(Markdown-structure-aware when possible), optionally enriched with
+contextual-retrieval sentences, embedded, and stored in ChromaDB. Content-hash
+dedup skips unchanged files on re-ingest.
+
+Query: HyDE query expansion (opt-in) → dense vector search + BM25 → Reciprocal
+Rank Fusion → cross-encoder rerank → prompt-injection sanitize → parent-child
+context expansion (prev/next chunks) for the LLM.
+
+### Ask (streaming answers)
+
+`POST /api/documents/ask/stream` returns Server-Sent Events:
+
+- `event: sources` — array of `{source, score, excerpt, page?, section?}`
+- `event: delta` — `{"text": "..."}` incremental answer tokens
+- `event: done` — `{"model": "..."}` (empty model ⇒ no LLM available)
+
+The web UI's **Ask** tab streams the answer live with clickable `[n]` citations
+that scroll to the matching source; clicking a source opens a full-document
+preview. `POST /api/documents/ask` remains available as the non-streaming variant.
+
+## Feature flags (env vars)
+
+| Var | Default | Effect |
+|-----|---------|--------|
+| `DOCLING_ENABLED` | `1` | Layout-aware PDF parsing (falls back to pypdf) |
+| `ENABLE_HYDE` | `0` (1 on GPU) | Hypothetical-document query expansion |
+| `EXPAND_CONTEXT` | `1` | Parent-child context expansion for the LLM |
+| `ENABLE_CONTEXTUAL_INGEST` | `0` | LLM-enriched chunks at ingest (slow, needs Ollama) |
+| `RERANKER_MODEL` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Reranker model |
+| `LLM_MODEL` | `qwen2.5:14b` | Ollama model for Ask |
+
+## GPU + Ollama
+
+`docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build`
+
+The `ollama` service auto-pulls `LLM_MODEL` on first start (idempotent) and is
+gated by a healthcheck so the backend waits for it. HyDE is enabled on GPU
+deploys. Requires the Unraid **Nvidia Driver** plugin; on Unraid 7.2, driver
+`580.105.05` has a known `--runtime=nvidia` bug — use `580.95.05`.
+
+## Unraid host integration (optional)
+
+- **System notifications**: uncomment the `unraid-notify` volume mount in
+  `docker-compose.yml` (backend service) to get "sync complete/failed"
+  notifications through Unraid's notification center. No-op if not mounted.
+- **Storage**: for best ChromaDB I/O, place `data/` under `/mnt/cache/appdata/`
+  (bypasses the FUSE shfs layer). Trade-off: not parity-protected.
+- **Backup**: use the **Appdata Backup** plugin (stops containers for a
+  consistent copy). Exclude `data/ollama/` from daily backups — model weights
+  are large and re-pullable.
+
+## Healthchecks
+
+All services define Docker healthchecks; `docker ps` shows health status.
+`mcp-server` and `frontend` wait for the backend to be healthy before starting.
+MCP discovery is exposed at `/.well-known/mcp`.

@@ -234,6 +234,42 @@ def _remove_content_hash(source: str, collection_name: str):
     atomic_update(_update)
 
 
+# Contextual retrieval (opt-in): an LLM writes a 1-2 sentence situating context
+# per chunk, prepended before embedding. Big retrieval win, slow ingest, needs Ollama.
+ENABLE_CONTEXTUAL_INGEST = os.environ.get("ENABLE_CONTEXTUAL_INGEST", "0") == "1"
+_CTX_TIMEOUT = float(os.environ.get("CONTEXTUAL_TIMEOUT", "20"))
+_ctx_unavailable_until = 0.0
+
+
+def _contextualize_chunk(doc_summary: str, source: str, chunk: str) -> str:
+    """Return a short context sentence for a chunk, or '' if LLM unavailable."""
+    global _ctx_unavailable_until
+    if time.monotonic() < _ctx_unavailable_until:
+        return ""
+    try:
+        from app.services.llm import LLM_URL, LLM_MODEL
+        import httpx
+        prompt = (
+            f"Document: {source}\nDocument overview:\n{doc_summary[:1500]}\n\n"
+            f"Chunk:\n{chunk[:1500]}\n\n"
+            "Give a 1-2 sentence context situating this chunk within the document, "
+            "to improve search retrieval. Answer with only the context sentence(s)."
+        )
+        resp = httpx.post(
+            f"{LLM_URL}/v1/chat/completions",
+            json={"model": LLM_MODEL,
+                  "messages": [{"role": "user", "content": prompt}],
+                  "temperature": 0.0, "max_tokens": 120},
+            timeout=_CTX_TIMEOUT,
+        )
+        if resp.status_code == 200:
+            return resp.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+    except Exception:
+        _ctx_unavailable_until = time.monotonic() + 300.0
+        logger.info("Contextual ingest LLM unreachable; disabling for 300s")
+    return ""
+
+
 def ingest_text(text: str, source: str, collection_name: str = "default", metadata: dict | None = None):
     content_hash = _compute_content_hash(text)
     if _check_content_hash(source, collection_name, content_hash):
@@ -258,7 +294,17 @@ def ingest_text(text: str, source: str, collection_name: str = "default", metada
         return 0
 
     ids = [compute_doc_id(source, i) for i in range(len(chunk_texts))]
-    embeddings = model.encode(chunk_texts).tolist()
+
+    # Contextual retrieval: embed (context + chunk) but store the original chunk.
+    embed_texts = chunk_texts
+    if ENABLE_CONTEXTUAL_INGEST:
+        doc_summary = " ".join(text.split()[:400])
+        embed_texts = []
+        for i, ch in enumerate(chunk_texts):
+            ctx = _contextualize_chunk(doc_summary, source, ch)
+            embed_texts.append(f"{ctx}\n{ch}" if ctx else ch)
+
+    embeddings = model.encode(embed_texts).tolist()
     metadatas = []
     for i, em in enumerate(extra_meta):
         m = {**(metadata or {}), "source": source, "chunk_index": i}
@@ -387,6 +433,50 @@ def _hyde_expand_sync(query_text: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Parent-child context expansion (uses stored prev/next chunk ids)
+# ---------------------------------------------------------------------------
+
+EXPAND_CONTEXT = os.environ.get("EXPAND_CONTEXT", "1") == "1"
+EXPAND_MAX_WORDS = int(os.environ.get("EXPAND_MAX_WORDS", "900"))
+_EXPAND_TOP_N = 3
+
+
+def _expand_results(collection, results: list[dict]):
+    """Attach expanded_content (prev + chunk + next) to the top results so the
+    LLM sees more context, while search UIs keep the original chunk."""
+    want_ids: set[str] = set()
+    for item in results[:_EXPAND_TOP_N]:
+        meta = item.get("metadata", {}) or {}
+        for k in ("prev_chunk_id", "next_chunk_id"):
+            if meta.get(k):
+                want_ids.add(meta[k])
+    if not want_ids:
+        return
+    try:
+        fetched = collection.get(ids=list(want_ids), include=["documents"])
+    except Exception:
+        logger.exception("Context expansion fetch failed")
+        return
+    by_id = dict(zip(fetched.get("ids", []), fetched.get("documents", [])))
+
+    for item in results[:_EXPAND_TOP_N]:
+        meta = item.get("metadata", {}) or {}
+        prev_text = by_id.get(meta.get("prev_chunk_id", ""), "")
+        next_text = by_id.get(meta.get("next_chunk_id", ""), "")
+        if not prev_text and not next_text:
+            continue
+        content = item["content"]
+        budget = max(EXPAND_MAX_WORDS - len(content.split()), 0)
+        half = budget // 2
+        prev_words = prev_text.split()
+        next_words = next_text.split()
+        prev_trim = " ".join(prev_words[-half:]) if half and prev_words else ""
+        next_trim = " ".join(next_words[:half]) if half and next_words else ""
+        parts = [p for p in (prev_trim, content, next_trim) if p]
+        item["expanded_content"] = "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
 # Query (vector + BM25 + rerank + sanitize + observability)
 # ---------------------------------------------------------------------------
 
@@ -441,8 +531,12 @@ def query(query_text: str, collection_name: str = "default", n_results: int = 5)
     t_rerank = time.monotonic()
 
     top = fused[:n_results]
+    if EXPAND_CONTEXT:
+        _expand_results(collection, top)
     for item in top:
         item["content"] = sanitize_chunk(item["content"])
+        if item.get("expanded_content"):
+            item["expanded_content"] = sanitize_chunk(item["expanded_content"])
 
     total_ms = round((time.monotonic() - t0) * 1000, 1)
     retrieve_ms = round((t_retrieve - t0) * 1000, 1)
@@ -491,9 +585,14 @@ def list_collections() -> list[dict]:
     for name in collection_names:
         try:
             col = client.get_collection(name)
-            result.append({"name": name, "document_count": col.count()})
+            chunk_count = col.count()
+            doc_count = 0
+            if chunk_count:
+                metas = col.get(include=["metadatas"]).get("metadatas", [])
+                doc_count = len({m.get("source") for m in metas if m.get("source")})
+            result.append({"name": name, "document_count": doc_count, "chunk_count": chunk_count})
         except Exception:
-            result.append({"name": name, "document_count": 0})
+            result.append({"name": name, "document_count": 0, "chunk_count": 0})
     return result
 
 
@@ -501,4 +600,11 @@ def delete_collection(name: str):
     client = get_chroma_client()
     client.delete_collection(name)
     _bm25_cache.pop(name, None)
+    # Clear stored content hashes, otherwise a reindex would dedup-skip every
+    # file as "unchanged" and leave the rebuilt collection empty.
+    from app.config import atomic_update
+
+    def _clear(config):
+        config.get("content_hashes", {}).pop(name, None)
+    atomic_update(_clear)
     logger.info("Deleted collection %s", name)

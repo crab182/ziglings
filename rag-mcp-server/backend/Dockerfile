@@ -19,6 +19,9 @@ from sentence_transformers import SentenceTransformer, CrossEncoder; \
 SentenceTransformer('all-MiniLM-L6-v2'); \
 CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')"
 
+# Pre-download Docling layout/table models so first PDF upload doesn't block
+RUN python -c "from docling.utils.model_downloader import download_models; download_models()"
+
 COPY . .
 
 EXPOSE 8000

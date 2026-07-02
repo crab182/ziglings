@@ -42,11 +42,25 @@ async def run_share_sync(name: str):
         smb_shares.update_sync_result(name, result)
         logger.info("Sync complete for %s: %d files, %d chunks",
                      name, result["files_processed"], result["total_chunks"])
+        _notify(
+            f"SMB sync complete: {name}",
+            f"{result['files_processed']} files, {result['total_chunks']} chunks ingested.",
+            "normal",
+        )
     except Exception:
         logger.exception("Sync failed for share: %s", name)
         smb_shares.update_sync_result(name, {"error": "sync failed"})
+        _notify(f"SMB sync failed: {name}", "The scheduled sync raised an error. Check backend logs.", "warning")
     finally:
         _running.discard(name)
+
+
+def _notify(subject: str, description: str, importance: str):
+    try:
+        from app.services.notify import send_unraid_notification
+        send_unraid_notification(subject, description, importance)
+    except Exception:
+        pass
 
 
 def start_scheduler():

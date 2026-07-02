@@ -600,3 +600,16 @@ async def mcp_info():
         "transports": ["sse", "streamable-http"],
         "auth": "Bearer token (API key)",
     }
+
+
+@app.get("/.well-known/mcp")
+async def well_known_mcp():
+    """Discovery server card (SEP-1649 style)."""
+    return {
+        "name": SERVER_INFO["name"],
+        "version": SERVER_INFO["version"],
+        "protocolVersion": "2024-11-05",
+        "capabilities": list(SERVER_CAPABILITIES.keys()),
+        "endpoints": {"sse": "/sse", "streamableHttp": "/mcp"},
+        "authentication": {"type": "bearer", "description": "API key as Bearer token"},
+    }

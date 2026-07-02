@@ -1,8 +1,9 @@
 import React, { useState, useEffect, useRef } from 'react'
 import {
-  uploadDocument, listDocuments, deleteDocument,
+  uploadDocumentWithProgress, listDocuments, deleteDocument,
   reindexCollection, listCollections, createCollection, deleteCollection
 } from '../services/api'
+import DocPreview from '../components/DocPreview'
 
 export default function Documents() {
   const [collections, setCollections] = useState([])
@@ -12,6 +13,8 @@ export default function Documents() {
   const [message, setMessage] = useState(null)
   const [newCollection, setNewCollection] = useState('')
   const [dragActive, setDragActive] = useState(false)
+  const [uploads, setUploads] = useState([]) // [{name, status, pct, detail}]
+  const [preview, setPreview] = useState(null)
   const fileInputRef = useRef()
 
   const refresh = async () => {
@@ -32,19 +35,25 @@ export default function Documents() {
   useEffect(() => { refresh() }, [activeCollection])
 
   const handleUpload = async (files) => {
-    setLoading(true)
+    const queue = files.map(f => ({ name: f.name, status: 'queued', pct: 0, detail: '' }))
+    setUploads(queue)
+    const setItem = (i, patch) => setUploads(u => u.map((it, idx) => (idx === i ? { ...it, ...patch } : it)))
+
     let uploaded = 0
-    for (const file of files) {
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i]
       try {
-        await uploadDocument(file, activeCollection)
+        setItem(i, { status: 'uploading' })
+        const res = await uploadDocumentWithProgress(file, activeCollection, (pct) => {
+          setItem(i, { pct, status: pct >= 100 ? 'processing' : 'uploading' })
+        })
+        setItem(i, { status: 'done', pct: 100, detail: `${res.chunks_created ?? 0} chunks` })
         uploaded++
       } catch (e) {
-        setMessage({ type: 'error', text: `Failed to upload ${file.name}: ${e.message}` })
+        setItem(i, { status: 'failed', detail: e.message })
       }
     }
-    if (uploaded > 0) {
-      setMessage({ type: 'success', text: `Uploaded ${uploaded} file(s)` })
-    }
+    if (uploaded > 0) setMessage({ type: 'success', text: `Uploaded ${uploaded} of ${files.length} file(s)` })
     await refresh()
   }
 
@@ -136,7 +145,7 @@ export default function Documents() {
                 className={`btn btn-sm ${activeCollection === c.name ? 'btn-primary' : 'btn-outline'}`}
                 onClick={() => setActiveCollection(c.name)}
               >
-                {c.name} ({c.document_count})
+                {c.name} ({c.document_count ?? 0} docs · {c.chunk_count ?? 0} chunks)
               </button>
               {c.name !== 'default' && (
                 <button className="btn btn-sm btn-danger" onClick={() => handleDeleteCollection(c.name)} title="Delete collection">x</button>
@@ -171,6 +180,26 @@ export default function Documents() {
             onChange={e => handleUpload(Array.from(e.target.files))}
           />
         </div>
+
+        {uploads.length > 0 && (
+          <div className="upload-queue">
+            {uploads.map((u, i) => (
+              <div key={i} className="upload-row">
+                <span className="upload-name">{u.name}</span>
+                <div className="upload-bar">
+                  <div className={`upload-bar-fill status-${u.status}`} style={{ width: `${u.pct}%` }} />
+                </div>
+                <span className={`upload-status status-${u.status}`}>
+                  {u.status === 'uploading' && `${u.pct}%`}
+                  {u.status === 'processing' && 'processing…'}
+                  {u.status === 'done' && `done · ${u.detail}`}
+                  {u.status === 'failed' && `failed · ${u.detail}`}
+                  {u.status === 'queued' && 'queued'}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
       <div className="card">
@@ -184,7 +213,11 @@ export default function Documents() {
             <tbody>
               {documents.map(doc => (
                 <tr key={doc}>
-                  <td>{doc}</td>
+                  <td>
+                    <button className="link-btn" onClick={() => setPreview({ source: doc, collection: activeCollection })}>
+                      {doc}
+                    </button>
+                  </td>
                   <td>
                     <button className="btn btn-danger btn-sm" onClick={() => handleDelete(doc)}>Delete</button>
                   </td>
@@ -196,6 +229,10 @@ export default function Documents() {
           <p style={{ color: 'var(--text-muted)' }}>No documents in this collection.</p>
         )}
       </div>
+
+      {preview && (
+        <DocPreview source={preview.source} collection={preview.collection} onClose={() => setPreview(null)} />
+      )}
     </div>
   )
 }

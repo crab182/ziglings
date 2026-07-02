@@ -52,11 +52,82 @@ export const uploadDocument = async (file, collection = 'default') => {
   return res.json();
 };
 
+// Upload with progress callback (XHR — fetch can't report upload progress)
+export const uploadDocumentWithProgress = (file, collection = 'default', onProgress) =>
+  new Promise((resolve, reject) => {
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('collection', collection);
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `${API_BASE}/documents/upload`);
+    const token = getToken();
+    if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable && onProgress) onProgress(Math.round((e.loaded / e.total) * 100));
+    };
+    xhr.onload = () => {
+      let data = {};
+      try { data = JSON.parse(xhr.responseText); } catch { /* noop */ }
+      if (xhr.status >= 200 && xhr.status < 300) resolve(data);
+      else reject(new Error(data.detail || `Upload failed (${xhr.status})`));
+    };
+    xhr.onerror = () => reject(new Error('Upload failed (network error)'));
+    xhr.send(formData);
+  });
+
 export const queryDocuments = (query, collection = 'default', n_results = 5) =>
   request('/documents/query', {
     method: 'POST',
     body: JSON.stringify({ query, collection, n_results }),
   });
+
+export const getDocumentContent = (source, collection = 'default') =>
+  request(`/documents/content?source=${encodeURIComponent(source)}&collection=${encodeURIComponent(collection)}`);
+
+// Streaming Ask: parses SSE frames (event: X / data: JSON) from a fetch body.
+// Handlers: { onSources, onDelta, onDone, onError }
+export const askDocumentsStream = async (query, collection = 'default', n_results = 5, handlers = {}) => {
+  const res = await fetch(`${API_BASE}/documents/ask/stream`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ query, collection, n_results }),
+  });
+  if (!res.ok || !res.body) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || `Stream failed: ${res.status}`);
+  }
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '';
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    const frames = buf.split('\n\n');
+    buf = frames.pop();
+    for (const frame of frames) {
+      let event = 'message';
+      let data = '';
+      for (const line of frame.split('\n')) {
+        if (line.startsWith('event:')) event = line.slice(6).trim();
+        else if (line.startsWith('data:')) data += line.slice(5).trim();
+      }
+      if (!data) continue;
+      let parsed;
+      try { parsed = JSON.parse(data); } catch { continue; }
+      if (event === 'sources') handlers.onSources?.(parsed);
+      else if (event === 'delta') handlers.onDelta?.(parsed.text || '');
+      else if (event === 'done') handlers.onDone?.(parsed.model || '');
+      else if (event === 'error') handlers.onError?.(parsed.detail || 'stream error');
+    }
+  }
+};
+
+export const getMcpInfo = async () => {
+  const res = await fetch('/mcp/info');
+  if (!res.ok) throw new Error('MCP info unavailable');
+  return res.json();
+};
 
 export const listDocuments = (collection = 'default') =>
   request(`/documents/list?collection=${encodeURIComponent(collection)}`);
