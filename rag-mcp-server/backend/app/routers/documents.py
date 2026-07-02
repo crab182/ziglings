@@ -9,6 +9,7 @@ from fastapi.responses import StreamingResponse
 from app.config import settings
 from app.models.schemas import IngestTextRequest, QueryRequest
 from app.services import rag_engine
+from app.services.audit import append_audit
 from app.services.document_parser import can_parse, parse_file
 from app.services.security import (
     require_admin_key,
@@ -137,18 +138,20 @@ async def list_collections(_: dict = Depends(require_api_key)):
 
 
 @router.post("/collections/{name}")
-async def create_collection(name: str, _: dict = Depends(require_admin_key)):
+async def create_collection(name: str, caller: dict = Depends(require_admin_key)):
     validate_collection_name(name)
     rag_engine.get_or_create_collection(name)
+    append_audit(caller.get("name", "?"), "collection.create", name)
     return {"name": name, "created": True}
 
 
 @router.delete("/collections/{name}")
-async def delete_collection(name: str, _: dict = Depends(require_admin_key)):
+async def delete_collection(name: str, caller: dict = Depends(require_admin_key)):
     validate_collection_name(name)
     if name == "default":
         raise HTTPException(400, "Cannot delete default collection")
     rag_engine.delete_collection(name)
+    append_audit(caller.get("name", "?"), "collection.delete", name)
     return {"name": name, "deleted": True}
 
 

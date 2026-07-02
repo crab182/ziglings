@@ -274,6 +274,17 @@ def run():
           "[1]" in msgs[0]["content"] and "context blocks" in msgs[0]["content"].lower(),
           msgs[0]["content"][:120])
 
+    # Admin audit log: privileged actions are recorded and readable.
+    r = client.post("/api/documents/collections/audit_test", headers=hdr)
+    check("create collection for audit", r.status_code == 200, f"{r.status_code}: {r.text[:150]}")
+    r = client.get("/api/admin/audit", headers=hdr)
+    check("audit endpoint 200", r.status_code == 200, f"{r.status_code}: {r.text[:150]}")
+    entries = r.json().get("entries", []) if r.status_code == 200 else []
+    check("audit log non-empty", len(entries) > 0, str(entries)[:150])
+    check("audit records collection.create",
+          any(e.get("action") == "collection.create" for e in entries),
+          str([e.get("action") for e in entries])[:200])
+
     # Contextual retrieval at ingest (opt-in via ENABLE_CONTEXTUAL_INGEST).
     # Capture what gets stored by wrapping the stub collection's upsert.
     from app.services import rag_engine as _re
