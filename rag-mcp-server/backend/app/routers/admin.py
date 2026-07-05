@@ -1,6 +1,7 @@
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import PlainTextResponse
 
 from app.config import load_config, save_config, settings
 from app.models.schemas import APIKeyCreate
@@ -43,15 +44,23 @@ async def create_api_key(req: APIKeyCreate, caller: dict = Depends(require_admin
     if req.name in existing:
         raise HTTPException(409, f"API key already exists: {req.name}")
     is_admin = req.is_admin or caller.get("bootstrap", False)
-    result = auth.create_api_key(req.name, req.description, is_admin=is_admin)
+    # ACLs only make sense on non-admin keys (admin bypasses them anyway).
+    collections = [] if is_admin else req.collections
+    result = auth.create_api_key(
+        req.name, req.description, is_admin=is_admin, collections=collections
+    )
     logger.info("API key created: name=%s is_admin=%s by=%s", req.name, is_admin, caller.get("name"))
-    append_audit(caller.get("name", "?"), "api_key.create", req.name)
+    append_audit(
+        caller.get("name", "?"), "api_key.create", req.name,
+        detail={"collections": collections} if collections else None,
+    )
     return {
         "name": result["name"],
         "key": result["raw_key"],
         "key_prefix": result["key_prefix"],
         "description": result["description"],
         "is_admin": result["is_admin"],
+        "collections": result.get("collections", []),
         "created_at": result["created_at"],
         "message": "Save this key - it cannot be retrieved again",
     }
@@ -99,6 +108,7 @@ async def get_config(_: dict = Depends(require_admin_key)):
             "key_prefix": k["key_prefix"],
             "is_admin": k.get("is_admin", False),
             "active": k.get("active", True),
+            "collections": k.get("collections", []),
         }
         for k in config.get("api_keys", [])
         if k.get("name") != auth.SERVICE_KEY_NAME
@@ -140,3 +150,55 @@ async def get_metrics(_: dict = Depends(require_admin_key)):
 async def get_audit(_: dict = Depends(require_admin_key)):
     """Recent admin activity: last 200 audit-log entries (newest last)."""
     return {"entries": read_audit(200)}
+
+
+def _prom_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+@router.get("/metrics/prometheus", response_class=PlainTextResponse)
+async def get_metrics_prometheus(_: dict = Depends(require_admin_key)):
+    """Metrics in Prometheus text exposition format (version 0.0.4).
+
+    Scrape with a bearer token in prometheus.yml:
+        authorization:
+          type: Bearer
+          credentials: <admin API key>
+    """
+    m = rag_engine.get_metrics()
+    lines = [
+        "# HELP rag_queries_total Total queries served since last restart.",
+        "# TYPE rag_queries_total counter",
+        f"rag_queries_total {m.get('query_count', 0)}",
+        "# HELP rag_ingests_total Total ingest operations since last restart.",
+        "# TYPE rag_ingests_total counter",
+        f"rag_ingests_total {m.get('ingest_count', 0)}",
+        "# HELP rag_retrieve_milliseconds_total Cumulative retrieval (vector+BM25) time.",
+        "# TYPE rag_retrieve_milliseconds_total counter",
+        f"rag_retrieve_milliseconds_total {m.get('total_retrieve_ms', 0):.1f}",
+        "# HELP rag_rerank_milliseconds_total Cumulative cross-encoder rerank time.",
+        "# TYPE rag_rerank_milliseconds_total counter",
+        f"rag_rerank_milliseconds_total {m.get('total_rerank_ms', 0):.1f}",
+    ]
+    try:
+        cols = rag_engine.list_collections()
+    except Exception:
+        logger.exception("Failed to list collections for prometheus metrics")
+        cols = []
+    lines += [
+        "# HELP rag_collection_documents Documents per collection.",
+        "# TYPE rag_collection_documents gauge",
+    ]
+    lines += [
+        f'rag_collection_documents{{collection="{_prom_escape(c["name"])}"}} {c.get("document_count", 0)}'
+        for c in cols
+    ]
+    lines += [
+        "# HELP rag_collection_chunks Stored chunks per collection.",
+        "# TYPE rag_collection_chunks gauge",
+    ]
+    lines += [
+        f'rag_collection_chunks{{collection="{_prom_escape(c["name"])}"}} {c.get("chunk_count", 0)}'
+        for c in cols
+    ]
+    return "\n".join(lines) + "\n"

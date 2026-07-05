@@ -42,6 +42,27 @@ def require_admin_key(authorization: str | None = Header(None)) -> dict:
     return entry
 
 
+def require_collection_access(caller: dict, collection: str) -> None:
+    """Per-collection ACL: keys with a non-empty `collections` list may only
+    touch those collections. Admin and bootstrap callers always pass, as do
+    keys without a list (unrestricted)."""
+    if caller.get("is_admin") or caller.get("bootstrap"):
+        return
+    allowed = caller.get("collections")
+    if allowed and collection not in allowed:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            f"This API key is not permitted to access collection '{collection}'",
+        )
+
+
+def allowed_collections(caller: dict) -> list[str] | None:
+    """The caller's collection allowlist, or None if unrestricted."""
+    if caller.get("is_admin") or caller.get("bootstrap"):
+        return None
+    return caller.get("collections") or None
+
+
 def validate_collection_name(name: str) -> str:
     if not COLLECTION_NAME_RE.match(name):
         raise HTTPException(

@@ -300,12 +300,44 @@ TOOLS = [
 
 ADMIN_TOOLS = {"ingest_note", "submit_agent_task", "get_agent_tasks", "create_collection", "delete_collection", "delete_document"}
 
+# Tools that read a specific collection — subject to per-collection ACLs on
+# scoped (non-admin) keys. The backend can't enforce this for MCP calls because
+# we call it with the admin service key, so the check must happen here.
+_COLLECTION_SCOPED_TOOLS = {"search_documents", "list_documents", "get_document"}
+
 # Mirrors backend validate_collection_name
 
 
-async def handle_tool_call(name: str, arguments: dict, caller_is_admin: bool) -> dict:
+async def handle_tool_call(
+    name: str,
+    arguments: dict,
+    caller_is_admin: bool,
+    caller_collections: list | None = None,
+) -> dict:
     if name in ADMIN_TOOLS and not caller_is_admin:
         return {"content": [{"type": "text", "text": "Permission denied: admin API key required"}], "isError": True}
+    # Per-collection ACL: scoped keys may only read their allowed collections.
+    acl = None if caller_is_admin else (caller_collections or None)
+    if acl and name in _COLLECTION_SCOPED_TOOLS:
+        wanted = arguments.get("collection", "default")
+        if wanted not in acl:
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": f"Permission denied: this API key cannot access collection '{wanted}'",
+                }],
+                "isError": True,
+            }
+    if acl and name == "get_collection_stats":
+        wanted = arguments.get("collection")
+        if wanted and wanted not in acl:
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": f"Permission denied: this API key cannot access collection '{wanted}'",
+                }],
+                "isError": True,
+            }
     # Use the MCP server's own credential — never forward the client's token.
     headers = _backend_headers()
     async with httpx.AsyncClient(base_url=BACKEND_URL, timeout=60.0, headers=headers) as client:
@@ -335,6 +367,8 @@ async def handle_tool_call(name: str, arguments: dict, caller_is_admin: bool) ->
             resp.raise_for_status()
             data = resp.json()
             collections = data["collections"]
+            if acl:
+                collections = [c for c in collections if c.get("name") in acl]
             text = "\n".join(
                 f"- **{c['name']}**: {c['document_count']} documents"
                 for c in collections
@@ -485,6 +519,8 @@ async def handle_tool_call(name: str, arguments: dict, caller_is_admin: bool) ->
             resp = await client.get("/api/documents/collections")
             resp.raise_for_status()
             cols = resp.json().get("collections", [])
+            if acl:
+                cols = [c for c in cols if c.get("name") in acl]
             wanted = arguments.get("collection")
             if wanted:
                 cols = [c for c in cols if c.get("name") == wanted]
@@ -611,8 +647,14 @@ def handle_jsonrpc(request_body: dict) -> dict | None:
     }
 
 
-async def _handle_async_jsonrpc(result: dict, caller_is_admin: bool) -> dict:
+async def _handle_async_jsonrpc(
+    result: dict,
+    caller_is_admin: bool,
+    caller_collections: list | None = None,
+) -> dict:
     """Handle async JSON-RPC calls (tools, resources, prompts)."""
+    # Per-collection ACL for scoped (non-admin) keys; None = unrestricted.
+    acl = None if caller_is_admin else (caller_collections or None)
     headers = _backend_headers()
     async with httpx.AsyncClient(base_url=BACKEND_URL, timeout=60.0, headers=headers) as client:
         if result.get("_async_tool_call"):
@@ -620,7 +662,9 @@ async def _handle_async_jsonrpc(result: dict, caller_is_admin: bool) -> dict:
             tool_name = params.get("name", "")
             tool_args = params.get("arguments", {})
             try:
-                tool_result = await handle_tool_call(tool_name, tool_args, caller_is_admin)
+                tool_result = await handle_tool_call(
+                    tool_name, tool_args, caller_is_admin, caller_collections=caller_collections
+                )
             except Exception:
                 logger.exception("Tool call failed: %s", tool_name)
                 tool_result = {"content": [{"type": "text", "text": "Tool execution failed"}], "isError": True}
@@ -631,6 +675,8 @@ async def _handle_async_jsonrpc(result: dict, caller_is_admin: bool) -> dict:
                 resp = await client.get("/api/documents/collections")
                 resp.raise_for_status()
                 collections = resp.json().get("collections", [])
+                if acl:
+                    collections = [c for c in collections if c.get("name") in acl]
                 resources = []
                 for col in collections:
                     resp2 = await client.get("/api/documents/list", params={"collection": col["name"]})
@@ -654,6 +700,11 @@ async def _handle_async_jsonrpc(result: dict, caller_is_admin: bool) -> dict:
             if not m:
                 return {"jsonrpc": "2.0", "id": result["id"], "error": {"code": -32602, "message": f"Invalid resource URI: {uri}"}}
             collection, source = m.group(1), m.group(2)
+            if acl and collection not in acl:
+                return {"jsonrpc": "2.0", "id": result["id"], "error": {
+                    "code": -32602,
+                    "message": f"Permission denied: this API key cannot access collection '{collection}'",
+                }}
             try:
                 resp = await client.get("/api/documents/content", params={"source": source, "collection": collection})
                 if resp.status_code == 404:
@@ -749,7 +800,7 @@ async def handle_message(
 
     is_async = any(result.get(k) for k in ("_async_tool_call", "_async_resource_list", "_async_resource_read", "_async_prompt_get"))
     if is_async:
-        response = await _handle_async_jsonrpc(result, caller.get("is_admin", False))
+        response = await _handle_async_jsonrpc(result, caller.get("is_admin", False), caller.get("collections"))
     else:
         response = result
 
@@ -775,7 +826,7 @@ async def mcp_streamable(request: Request, authorization: str | None = Header(No
 
     is_async = any(result.get(k) for k in ("_async_tool_call", "_async_resource_list", "_async_resource_read", "_async_prompt_get"))
     if is_async:
-        return await _handle_async_jsonrpc(result, caller.get("is_admin", False))
+        return await _handle_async_jsonrpc(result, caller.get("is_admin", False), caller.get("collections"))
 
     return result
 

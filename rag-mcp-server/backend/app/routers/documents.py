@@ -12,8 +12,10 @@ from app.services import rag_engine
 from app.services.audit import append_audit
 from app.services.document_parser import can_parse, parse_file
 from app.services.security import (
+    allowed_collections,
     require_admin_key,
     require_api_key,
+    require_collection_access,
     safe_filename,
     safe_join,
     validate_collection_name,
@@ -62,7 +64,8 @@ async def upload_document(
 
 
 @router.post("/query")
-async def query_documents(req: QueryRequest, _: dict = Depends(require_api_key)):
+async def query_documents(req: QueryRequest, caller: dict = Depends(require_api_key)):
+    require_collection_access(caller, req.collection)
     # query() is CPU-bound (embedding/BM25/rerank) and may do a network call
     # for HyDE — run it off the event loop so SSE/MCP stay responsive.
     results = await asyncio.to_thread(
@@ -72,8 +75,9 @@ async def query_documents(req: QueryRequest, _: dict = Depends(require_api_key))
 
 
 @router.get("/list")
-async def list_documents(collection: str = "default", _: dict = Depends(require_api_key)):
+async def list_documents(collection: str = "default", caller: dict = Depends(require_api_key)):
     validate_collection_name(collection)
+    require_collection_access(caller, collection)
     sources = rag_engine.list_documents(collection)
     return {"collection": collection, "documents": sources}
 
@@ -139,8 +143,12 @@ async def reindex_collection(collection: str = "default", _: dict = Depends(requ
 
 
 @router.get("/collections")
-async def list_collections(_: dict = Depends(require_api_key)):
-    return {"collections": rag_engine.list_collections()}
+async def list_collections(caller: dict = Depends(require_api_key)):
+    cols = rag_engine.list_collections()
+    allowed = allowed_collections(caller)
+    if allowed is not None:
+        cols = [c for c in cols if c["name"] in allowed]
+    return {"collections": cols}
 
 
 @router.post("/collections/{name}")
@@ -165,10 +173,11 @@ async def delete_collection(name: str, caller: dict = Depends(require_admin_key)
 async def get_document_content(
     source: str,
     collection: str = "default",
-    _: dict = Depends(require_api_key),
+    caller: dict = Depends(require_api_key),
 ):
     """Reconstruct full document content from its chunks, ordered by chunk_index."""
     validate_collection_name(collection)
+    require_collection_access(caller, collection)
     if not source or len(source) > 512:
         raise HTTPException(400, "Invalid source parameter")
     col = rag_engine.get_or_create_collection(collection)
@@ -215,9 +224,10 @@ def _llm_chunks(results: list[dict]) -> list[dict]:
 
 
 @router.post("/ask")
-async def ask_documents(req: QueryRequest, _: dict = Depends(require_api_key)):
+async def ask_documents(req: QueryRequest, caller: dict = Depends(require_api_key)):
     """Search + generate an answer using a local LLM (Ollama). Falls back to search-only."""
     validate_collection_name(req.collection)
+    require_collection_access(caller, req.collection)
     results = await asyncio.to_thread(
         rag_engine.query, req.query, collection_name=req.collection, n_results=req.n_results
     )
@@ -238,10 +248,11 @@ async def ask_documents(req: QueryRequest, _: dict = Depends(require_api_key)):
 
 
 @router.post("/ask/stream")
-async def ask_documents_stream(req: QueryRequest, _: dict = Depends(require_api_key)):
+async def ask_documents_stream(req: QueryRequest, caller: dict = Depends(require_api_key)):
     """Streaming variant of /ask. SSE events: sources -> delta* -> done.
     All data payloads are JSON-encoded (raw newlines would break SSE framing)."""
     validate_collection_name(req.collection)
+    require_collection_access(caller, req.collection)
 
     def sse(event: str, data) -> str:
         return f"event: {event}\ndata: {json.dumps(data)}\n\n"

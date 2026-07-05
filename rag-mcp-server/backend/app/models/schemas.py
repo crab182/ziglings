@@ -86,6 +86,14 @@ class APIKeyCreate(BaseModel):
     name: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
     description: str = Field(default="", max_length=256)
     is_admin: bool = False
+    # Per-collection ACL: non-empty restricts this key to these collections.
+    # Empty (default) = unrestricted. Ignored for admin keys (they bypass).
+    collections: list[str] = Field(default_factory=list, max_length=32)
+
+    @field_validator("collections")
+    @classmethod
+    def _v_collections(cls, v: list[str]) -> list[str]:
+        return [_check_collection(c) for c in v]
 
 
 class APIKeyResponse(BaseModel):

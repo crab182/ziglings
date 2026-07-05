@@ -114,6 +114,33 @@ For clients that support it, use `http://192.168.1.52:8901/mcp` as the endpoint.
 - `POST /api/smb/browse` - Browse SMB share
 - `POST /api/smb/ingest` - Ingest from SMB share
 - `GET /api/admin/status` - Server status
+- `GET /api/admin/metrics/prometheus` - Metrics in Prometheus text format (admin key)
+
+### Per-collection ACLs
+
+Non-admin API keys can be restricted to specific collections at creation time
+(`collections` field in `POST /api/admin/api-keys`, or the "Collection access"
+input in the UI). A scoped key can only query/list/read its collections;
+`GET /api/documents/collections` is filtered to its scope. Empty list = all
+collections. Admin keys always bypass ACLs.
+
+### Prometheus scraping
+
+`GET /api/admin/metrics/prometheus` exposes query/ingest counters, cumulative
+retrieve/rerank latency, and per-collection document/chunk gauges. Example
+`prometheus.yml` job (requires an admin key):
+
+```yaml
+scrape_configs:
+  - job_name: rag-mcp
+    metrics_path: /api/admin/metrics/prometheus
+    scheme: http
+    static_configs:
+      - targets: ["192.168.1.52:8900"]
+    authorization:
+      type: Bearer
+      credentials: <admin API key>
+```
 
 ### MCP Server (port 8901)
 - `GET /sse` - SSE transport endpoint

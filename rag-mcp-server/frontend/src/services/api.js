@@ -237,10 +237,10 @@ export const getMetrics = () => request('/admin/metrics');
 
 // Admin
 export const getStatus = () => request('/admin/status');
-export const createAPIKey = (name, description = '', is_admin = false) =>
+export const createAPIKey = (name, description = '', is_admin = false, collections = []) =>
   request('/admin/api-keys', {
     method: 'POST',
-    body: JSON.stringify({ name, description, is_admin }),
+    body: JSON.stringify({ name, description, is_admin, collections }),
   });
 export const listAPIKeys = () => request('/admin/api-keys');
 export const deleteAPIKey = (name) =>
