@@ -58,6 +58,20 @@ function authHeaders() {
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
+// FastAPI validation errors (422) put a LIST of error objects in `detail`;
+// passing that to new Error() renders "[object Object]". Flatten to the
+// human-readable messages instead.
+function detailText(detail) {
+  if (typeof detail === 'string') return detail;
+  if (Array.isArray(detail)) {
+    return detail
+      .map(d => (d && typeof d === 'object' ? d.msg || JSON.stringify(d) : String(d)))
+      .join('; ');
+  }
+  if (detail && typeof detail === 'object') return JSON.stringify(detail);
+  return '';
+}
+
 async function request(path, options = {}) {
   const { headers, ...rest } = options;
   const res = await fetch(`${API_BASE}${path}`, {
@@ -70,11 +84,11 @@ async function request(path, options = {}) {
   });
   if (res.status === 401 || res.status === 403) {
     const error = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(error.detail || `Unauthorized: ${res.status}`);
+    throw new Error(detailText(error.detail) || `Unauthorized: ${res.status}`);
   }
   if (!res.ok) {
     const error = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(error.detail || `Request failed: ${res.status}`);
+    throw new Error(detailText(error.detail) || `Request failed: ${res.status}`);
   }
   return res.json();
 }

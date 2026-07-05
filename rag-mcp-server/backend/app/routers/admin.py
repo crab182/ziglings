@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -7,20 +8,26 @@ from app.config import load_config, save_config, settings
 from app.models.schemas import APIKeyCreate
 from app.services import auth, rag_engine
 from app.services.audit import append_audit, read_audit
-from app.services.security import require_admin_key, require_api_key
+from app.services.security import allowed_collections, require_admin_key, require_api_key
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
 
 @router.get("/status")
-async def get_status(_: dict = Depends(require_api_key)):
+async def get_status(caller: dict = Depends(require_api_key)):
     config = load_config()
     try:
-        collections = rag_engine.list_collections()
+        # list_collections scans chunk metadata (O(total chunks)) — off the loop.
+        collections = await asyncio.to_thread(rag_engine.list_collections)
+        # Scoped keys must not enumerate out-of-scope collection names here —
+        # this would bypass the filtered GET /api/documents/collections.
+        allowed = allowed_collections(caller)
+        if allowed is not None:
+            collections = [c for c in collections if c["name"] in allowed]
         total_docs = sum(c["document_count"] for c in collections)
         collection_names = [c["name"] for c in collections]
-    except Exception as e:
+    except Exception:
         logger.exception("Failed to query collections for status")
         collections = []
         total_docs = 0
@@ -43,6 +50,16 @@ async def create_api_key(req: APIKeyCreate, caller: dict = Depends(require_admin
     existing = {k["name"] for k in auth.list_api_keys()}
     if req.name in existing:
         raise HTTPException(409, f"API key already exists: {req.name}")
+    if caller.get("bootstrap", False) and (not req.is_admin or req.collections):
+        # Fail loud rather than silently minting an unrestricted admin key when
+        # the operator asked for a scoped/read-only one — the first key is
+        # always admin (it must be able to manage keys), so a restricted
+        # request during bootstrap can't be honored.
+        raise HTTPException(
+            400,
+            "The first key must be an unrestricted admin key "
+            "(is_admin=true, no collections). Create scoped keys with it afterwards.",
+        )
     is_admin = req.is_admin or caller.get("bootstrap", False)
     # ACLs only make sense on non-admin keys (admin bypasses them anyway).
     collections = [] if is_admin else req.collections
@@ -153,6 +170,9 @@ async def get_audit(_: dict = Depends(require_admin_key)):
 
 
 def _prom_escape(value: str) -> str:
+    # Defense-in-depth: collection names are already constrained to
+    # [A-Za-z0-9_-] by validate_collection_name, so this is a no-op today —
+    # kept so a future loosening of that rule can't corrupt the exposition.
     return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
 
@@ -181,24 +201,19 @@ async def get_metrics_prometheus(_: dict = Depends(require_admin_key)):
         f"rag_rerank_milliseconds_total {m.get('total_rerank_ms', 0):.1f}",
     ]
     try:
-        cols = rag_engine.list_collections()
+        # O(total chunks) metadata scan — keep it off the event loop; a scrape
+        # every few seconds must not stall /query or SSE streams.
+        cols = await asyncio.to_thread(rag_engine.list_collections)
     except Exception:
         logger.exception("Failed to list collections for prometheus metrics")
         cols = []
-    lines += [
-        "# HELP rag_collection_documents Documents per collection.",
-        "# TYPE rag_collection_documents gauge",
-    ]
-    lines += [
-        f'rag_collection_documents{{collection="{_prom_escape(c["name"])}"}} {c.get("document_count", 0)}'
-        for c in cols
-    ]
-    lines += [
-        "# HELP rag_collection_chunks Stored chunks per collection.",
-        "# TYPE rag_collection_chunks gauge",
-    ]
-    lines += [
-        f'rag_collection_chunks{{collection="{_prom_escape(c["name"])}"}} {c.get("chunk_count", 0)}'
-        for c in cols
-    ]
+    for metric, help_text, field in (
+        ("rag_collection_documents", "Documents per collection.", "document_count"),
+        ("rag_collection_chunks", "Stored chunks per collection.", "chunk_count"),
+    ):
+        lines += [f"# HELP {metric} {help_text}", f"# TYPE {metric} gauge"]
+        lines += [
+            f'{metric}{{collection="{_prom_escape(c["name"])}"}} {c.get(field, 0)}'
+            for c in cols
+        ]
     return "\n".join(lines) + "\n"

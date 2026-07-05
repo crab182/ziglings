@@ -163,6 +163,13 @@ def run():
     r = client.get("/api/admin/bootstrap-required")
     check("bootstrap required (fresh)", r.json().get("bootstrap_required") is True)
 
+    # Bootstrap must fail loud on a scoped/non-admin request rather than
+    # silently minting an unrestricted admin key.
+    r = client.post("/api/admin/api-keys", json={"name": "reader", "collections": ["public"]})
+    check("bootstrap rejects scoped key request", r.status_code == 400, f"{r.status_code}: {r.text[:200]}")
+    r = client.post("/api/admin/api-keys", json={"name": "reader", "is_admin": False})
+    check("bootstrap rejects non-admin key request", r.status_code == 400, f"{r.status_code}")
+
     r = client.post("/api/admin/api-keys", json={"name": "admin", "is_admin": True})
     check("create bootstrap key", r.status_code == 200, f"{r.status_code}: {r.text[:300]}")
     key = r.json().get("key") if r.status_code == 200 else None
@@ -351,6 +358,17 @@ def run():
     r = client.post("/api/admin/api-keys", headers=hdr,
                     json={"name": "badscope", "collections": ["../etc"]})
     check("invalid ACL collection name rejected", r.status_code == 422, f"{r.status_code}")
+
+    # /admin/status must not leak out-of-scope collection names to scoped keys
+    # (it would bypass the filtered /documents/collections listing).
+    r = client.get("/api/admin/status", headers=scoped_hdr)
+    status_cols = r.json().get("collections", []) if r.status_code == 200 else None
+    check("admin/status filtered for scoped key",
+          r.status_code == 200 and set(status_cols) <= {"acl_allowed"},
+          f"{r.status_code}: {status_cols}")
+    r = client.get("/api/admin/status", headers=hdr)
+    check("admin/status unfiltered for admin",
+          "default" in r.json().get("collections", []), r.text[:150])
 
     # Prometheus metrics endpoint (admin-gated, text exposition format).
     r = client.get("/api/admin/metrics/prometheus", headers=hdr)

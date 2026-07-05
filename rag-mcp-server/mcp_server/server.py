@@ -303,7 +303,33 @@ ADMIN_TOOLS = {"ingest_note", "submit_agent_task", "get_agent_tasks", "create_co
 # Tools that read a specific collection — subject to per-collection ACLs on
 # scoped (non-admin) keys. The backend can't enforce this for MCP calls because
 # we call it with the admin service key, so the check must happen here.
-_COLLECTION_SCOPED_TOOLS = {"search_documents", "list_documents", "get_document"}
+# Any new tool whose inputSchema takes a `collection` must join this set.
+_COLLECTION_SCOPED_TOOLS = {"search_documents", "list_documents", "get_document", "ask_documents"}
+
+
+def _acl_for(caller_is_admin: bool, caller_collections: list | None) -> list | None:
+    """The caller's collection allowlist, or None if unrestricted (admin or
+    unscoped key). Single source of truth for ACL semantics in this service —
+    mirrors backend security.allowed_collections."""
+    return None if caller_is_admin else (caller_collections or None)
+
+
+def _deny_collection(name: str) -> dict:
+    return {
+        "content": [{
+            "type": "text",
+            "text": f"Permission denied: this API key cannot access collection '{name}'",
+        }],
+        "isError": True,
+    }
+
+
+def _filter_by_acl(cols: list, acl: list | None) -> list:
+    """Filter collection dicts (or name strings) down to the caller's scope."""
+    if not acl:
+        return cols
+    return [c for c in cols if (c.get("name") if isinstance(c, dict) else c) in acl]
+
 
 # Mirrors backend validate_collection_name
 
@@ -317,27 +343,15 @@ async def handle_tool_call(
     if name in ADMIN_TOOLS and not caller_is_admin:
         return {"content": [{"type": "text", "text": "Permission denied: admin API key required"}], "isError": True}
     # Per-collection ACL: scoped keys may only read their allowed collections.
-    acl = None if caller_is_admin else (caller_collections or None)
+    acl = _acl_for(caller_is_admin, caller_collections)
     if acl and name in _COLLECTION_SCOPED_TOOLS:
         wanted = arguments.get("collection", "default")
         if wanted not in acl:
-            return {
-                "content": [{
-                    "type": "text",
-                    "text": f"Permission denied: this API key cannot access collection '{wanted}'",
-                }],
-                "isError": True,
-            }
+            return _deny_collection(wanted)
     if acl and name == "get_collection_stats":
         wanted = arguments.get("collection")
         if wanted and wanted not in acl:
-            return {
-                "content": [{
-                    "type": "text",
-                    "text": f"Permission denied: this API key cannot access collection '{wanted}'",
-                }],
-                "isError": True,
-            }
+            return _deny_collection(wanted)
     # Use the MCP server's own credential — never forward the client's token.
     headers = _backend_headers()
     async with httpx.AsyncClient(base_url=BACKEND_URL, timeout=60.0, headers=headers) as client:
@@ -362,13 +376,38 @@ async def handle_tool_call(
                 "isError": False,
             }
 
+        elif name == "ask_documents":
+            # LLM generation can take far longer than the default client
+            # timeout (prompt eval + token generation on a 14B model).
+            resp = await client.post("/api/documents/ask", json={
+                "query": arguments.get("query", ""),
+                "collection": arguments.get("collection", "default"),
+                "n_results": min(max(int(arguments.get("n_results", 5)), 1), 50),
+            }, timeout=300.0)
+            resp.raise_for_status()
+            data = resp.json()
+            answer = data.get("answer", "")
+            sources = data.get("sources", [])
+            src_lines = "\n".join(
+                f"- {s.get('source', '?')} (score: {s.get('score', 0)})" for s in sources
+            )
+            text = (
+                (answer or "No LLM answer available — showing search results only.")
+                + (f"\n\n**Sources:**\n{src_lines}" if src_lines else "")
+            )
+            return {
+                "content": [
+                    {"type": "text", "text": text},
+                    {"type": "text", "text": json.dumps(data)},
+                ],
+                "isError": False,
+            }
+
         elif name == "list_collections":
             resp = await client.get("/api/documents/collections")
             resp.raise_for_status()
             data = resp.json()
-            collections = data["collections"]
-            if acl:
-                collections = [c for c in collections if c.get("name") in acl]
+            collections = _filter_by_acl(data["collections"], acl)
             text = "\n".join(
                 f"- **{c['name']}**: {c['document_count']} documents"
                 for c in collections
@@ -401,13 +440,22 @@ async def handle_tool_call(
             resp = await client.get("/api/admin/status")
             resp.raise_for_status()
             data = resp.json()
-            text = (
-                f"**Server:** {data['hostname']} ({data['ip']})\n"
-                f"**MCP Enabled:** {data['mcp_enabled']}\n"
-                f"**Total Documents:** {data['total_documents']}\n"
-                f"**Collections:** {', '.join(data['collections']) or 'none'}\n"
-                f"**Active API Keys:** {data['active_credentials']}"
-            )
+            if acl:
+                # Scoped key: hide out-of-scope collection names and the
+                # aggregate counts that span collections outside its scope.
+                data["collections"] = _filter_by_acl(data.get("collections", []), acl)
+                data.pop("total_documents", None)
+                data.pop("active_credentials", None)
+            parts = [
+                f"**Server:** {data['hostname']} ({data['ip']})",
+                f"**MCP Enabled:** {data['mcp_enabled']}",
+            ]
+            if "total_documents" in data:
+                parts.append(f"**Total Documents:** {data['total_documents']}")
+            parts.append(f"**Collections:** {', '.join(data['collections']) or 'none'}")
+            if "active_credentials" in data:
+                parts.append(f"**Active API Keys:** {data['active_credentials']}")
+            text = "\n".join(parts)
             return {
                 "content": [
                     {"type": "text", "text": text},
@@ -518,9 +566,7 @@ async def handle_tool_call(
         elif name == "get_collection_stats":
             resp = await client.get("/api/documents/collections")
             resp.raise_for_status()
-            cols = resp.json().get("collections", [])
-            if acl:
-                cols = [c for c in cols if c.get("name") in acl]
+            cols = _filter_by_acl(resp.json().get("collections", []), acl)
             wanted = arguments.get("collection")
             if wanted:
                 cols = [c for c in cols if c.get("name") == wanted]
@@ -654,7 +700,7 @@ async def _handle_async_jsonrpc(
 ) -> dict:
     """Handle async JSON-RPC calls (tools, resources, prompts)."""
     # Per-collection ACL for scoped (non-admin) keys; None = unrestricted.
-    acl = None if caller_is_admin else (caller_collections or None)
+    acl = _acl_for(caller_is_admin, caller_collections)
     headers = _backend_headers()
     async with httpx.AsyncClient(base_url=BACKEND_URL, timeout=60.0, headers=headers) as client:
         if result.get("_async_tool_call"):
@@ -674,9 +720,7 @@ async def _handle_async_jsonrpc(
             try:
                 resp = await client.get("/api/documents/collections")
                 resp.raise_for_status()
-                collections = resp.json().get("collections", [])
-                if acl:
-                    collections = [c for c in collections if c.get("name") in acl]
+                collections = _filter_by_acl(resp.json().get("collections", []), acl)
                 resources = []
                 for col in collections:
                     resp2 = await client.get("/api/documents/list", params={"collection": col["name"]})
