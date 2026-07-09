@@ -72,7 +72,7 @@ class FakeClient:
     _responses: dict = {}
 
 
-def _call(name, args, *, is_admin=True, responses=None):
+def _call(name, args, *, is_admin=True, responses=None, collections=None):
     """Run handle_tool_call with FakeClient stubbed in for httpx.AsyncClient."""
     FakeClient._responses = responses or {}
     captured = {"client": None}
@@ -85,7 +85,9 @@ def _call(name, args, *, is_admin=True, responses=None):
     real = server.httpx.AsyncClient
     server.httpx.AsyncClient = _factory
     try:
-        result = asyncio.run(server.handle_tool_call(name, args, caller_is_admin=is_admin))
+        result = asyncio.run(server.handle_tool_call(
+            name, args, caller_is_admin=is_admin, caller_collections=collections
+        ))
     finally:
         server.httpx.AsyncClient = real
     return result, captured["client"]
@@ -285,6 +287,112 @@ class CollectionStatsTests(unittest.TestCase):
     def test_unknown_collection(self):
         result, _ = _call("get_collection_stats", {"collection": "nope"}, responses=self._stats_resp())
         self.assertTrue(result["isError"])
+
+
+class CollectionACLTests(unittest.TestCase):
+    """Per-collection ACLs on scoped (non-admin) keys."""
+
+    def _cols_resp(self):
+        return {("GET", "/api/documents/collections"): FakeResponse(200, {"collections": [
+            {"name": "default", "document_count": 3, "chunk_count": 40},
+            {"name": "manuals", "document_count": 1, "chunk_count": 12},
+        ]})}
+
+    def test_scoped_search_denied_outside_scope(self):
+        result, client = _call("search_documents", {"query": "x", "collection": "default"},
+                               is_admin=False, collections=["manuals"])
+        self.assertTrue(result["isError"])
+        self.assertIn("cannot access collection 'default'", result["content"][0]["text"])
+        self.assertIsNone(client)  # denied before any backend call
+
+    def test_scoped_search_allowed_in_scope(self):
+        result, client = _call(
+            "search_documents", {"query": "x", "collection": "manuals"},
+            is_admin=False, collections=["manuals"],
+            responses={("POST", "/api/documents/query"): FakeResponse(200, {"results": []})},
+        )
+        self.assertFalse(result["isError"])
+
+    def test_scoped_default_collection_implied(self):
+        # Omitting `collection` means "default" — still subject to the ACL.
+        result, client = _call("get_document", {"source": "a.pdf"},
+                               is_admin=False, collections=["manuals"])
+        self.assertTrue(result["isError"])
+        self.assertIsNone(client)
+
+    def test_admin_bypasses_acl(self):
+        result, _ = _call(
+            "search_documents", {"query": "x", "collection": "default"},
+            is_admin=True, collections=["manuals"],
+            responses={("POST", "/api/documents/query"): FakeResponse(200, {"results": []})},
+        )
+        self.assertFalse(result["isError"])
+
+    def test_list_collections_filtered(self):
+        result, _ = _call("list_collections", {}, is_admin=False, collections=["manuals"],
+                          responses=self._cols_resp())
+        self.assertFalse(result["isError"])
+        payload = json.loads(result["content"][1]["text"])
+        names = [c["name"] if isinstance(c, dict) else c for c in payload]
+        self.assertEqual(names, ["manuals"])
+
+    def test_stats_filtered_for_scoped_key(self):
+        result, _ = _call("get_collection_stats", {}, is_admin=False, collections=["manuals"],
+                          responses=self._cols_resp())
+        self.assertEqual(json.loads(result["content"][1]["text"]),
+                         [{"name": "manuals", "document_count": 1, "chunk_count": 12}])
+
+    def test_stats_denied_outside_scope(self):
+        result, _ = _call("get_collection_stats", {"collection": "default"},
+                          is_admin=False, collections=["manuals"], responses=self._cols_resp())
+        self.assertTrue(result["isError"])
+        self.assertIn("cannot access", result["content"][0]["text"])
+
+    def _status_resp(self):
+        return {("GET", "/api/admin/status"): FakeResponse(200, {
+            "hostname": "srv", "ip": "1.2.3.4", "mcp_enabled": True,
+            "total_documents": 55, "collections": ["default", "manuals", "hr_confidential"],
+            "active_credentials": 3,
+        })}
+
+    def test_server_status_filtered_for_scoped_key(self):
+        # Scoped keys must not enumerate out-of-scope collection names or see
+        # aggregates that span them (get_server_status leak regression).
+        result, _ = _call("get_server_status", {}, is_admin=False, collections=["manuals"],
+                          responses=self._status_resp())
+        self.assertFalse(result["isError"])
+        payload = json.loads(result["content"][1]["text"])
+        self.assertEqual(payload["collections"], ["manuals"])
+        self.assertNotIn("total_documents", payload)
+        self.assertNotIn("active_credentials", payload)
+        self.assertNotIn("hr_confidential", result["content"][0]["text"])
+
+    def test_server_status_unfiltered_for_admin(self):
+        result, _ = _call("get_server_status", {}, is_admin=True, responses=self._status_resp())
+        payload = json.loads(result["content"][1]["text"])
+        self.assertEqual(len(payload["collections"]), 3)
+        self.assertEqual(payload["total_documents"], 55)
+
+
+class AskDocumentsTests(unittest.TestCase):
+    _RESP = {("POST", "/api/documents/ask"): FakeResponse(200, {
+        "answer": "The reset button is on the back.", "model": "qwen",
+        "query": "q", "sources": [{"source": "manual.pdf", "score": 0.9, "excerpt": "..."}],
+    })}
+
+    def test_dual_format_answer(self):
+        result, client = _call("ask_documents", {"query": "where is reset?"}, responses=self._RESP)
+        self.assertFalse(result["isError"])
+        self.assertEqual(len(result["content"]), 2)
+        self.assertIn("reset button", result["content"][0]["text"])
+        self.assertIn("manual.pdf", result["content"][0]["text"])
+        self.assertEqual(json.loads(result["content"][1]["text"])["model"], "qwen")
+
+    def test_scoped_key_denied_outside_scope(self):
+        result, client = _call("ask_documents", {"query": "x", "collection": "default"},
+                               is_admin=False, collections=["manuals"])
+        self.assertTrue(result["isError"])
+        self.assertIsNone(client)  # denied before any backend call
 
 
 if __name__ == "__main__":

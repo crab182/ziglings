@@ -22,8 +22,14 @@ def hash_key(key: str) -> str:
     return hashlib.sha256(key.encode()).hexdigest()
 
 
-def _make_entry(name: str, raw_key: str, description: str, is_admin: bool) -> dict:
-    return {
+def _make_entry(
+    name: str,
+    raw_key: str,
+    description: str,
+    is_admin: bool,
+    collections: list[str] | None = None,
+) -> dict:
+    entry = {
         "name": name,
         "key_hash": hash_key(raw_key),
         "key_prefix": raw_key[:12] + "...",
@@ -32,11 +38,21 @@ def _make_entry(name: str, raw_key: str, description: str, is_admin: bool) -> di
         "created_at": datetime.now(timezone.utc).isoformat(),
         "active": True,
     }
+    # Per-collection ACL: a non-empty list restricts this key to those
+    # collections. Absent/empty = unrestricted. Admin keys always bypass.
+    if collections:
+        entry["collections"] = collections
+    return entry
 
 
-def create_api_key(name: str, description: str = "", is_admin: bool = False) -> dict:
+def create_api_key(
+    name: str,
+    description: str = "",
+    is_admin: bool = False,
+    collections: list[str] | None = None,
+) -> dict:
     raw_key = generate_api_key()
-    entry = _make_entry(name, raw_key, description, is_admin)
+    entry = _make_entry(name, raw_key, description, is_admin, collections=collections)
     atomic_update(lambda cfg: cfg.setdefault("api_keys", []).append(entry))
     return {"raw_key": raw_key, **entry}
 
@@ -73,6 +89,7 @@ def list_api_keys() -> list[dict]:
             "is_admin": e.get("is_admin", False),
             "created_at": e["created_at"],
             "active": e.get("active", True),
+            "collections": e.get("collections", []),
         }
         for e in config.get("api_keys", [])
         if e.get("name") != SERVICE_KEY_NAME

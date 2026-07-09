@@ -6,6 +6,7 @@ export default function APIKeys() {
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
   const [isAdmin, setIsAdmin] = useState(false)
+  const [collections, setCollections] = useState('')
   const [newKey, setNewKey] = useState(null)
   const [loading, setLoading] = useState(false)
   const [message, setMessage] = useState(null)
@@ -23,11 +24,13 @@ export default function APIKeys() {
     }
     setLoading(true)
     try {
-      const result = await createAPIKey(name.trim(), description.trim(), isAdmin)
+      const cols = collections.split(',').map(c => c.trim()).filter(Boolean)
+      const result = await createAPIKey(name.trim(), description.trim(), isAdmin, isAdmin ? [] : cols)
       setNewKey(result.key)
       setName('')
       setDescription('')
       setIsAdmin(false)
+      setCollections('')
       setMessage({ type: 'success', text: 'API key created. Copy it now - it cannot be retrieved later.' })
       refresh()
     } catch (e) {
@@ -121,6 +124,17 @@ export default function APIKeys() {
             Admin key (can manage keys, collections, SMB; otherwise read-only)
           </label>
         </div>
+        {!isAdmin && (
+          <div className="form-group">
+            <label>Collection access (optional)</label>
+            <input
+              className="input"
+              value={collections}
+              onChange={e => setCollections(e.target.value)}
+              placeholder="Comma-separated collections this key may search, e.g. manuals,wiki. Empty = all."
+            />
+          </div>
+        )}
         <button className="btn btn-primary" onClick={handleCreate} disabled={loading}>
           {loading ? <><span className="spinner"></span> Creating...</> : 'Create API Key'}
         </button>
@@ -153,6 +167,11 @@ export default function APIKeys() {
                     <span className={`badge ${k.is_admin ? 'badge-danger' : 'badge-success'}`}>
                       {k.is_admin ? 'admin' : 'read-only'}
                     </span>
+                    {!k.is_admin && k.collections?.length > 0 && (
+                      <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '0.25rem' }}>
+                        scope: {k.collections.join(', ')}
+                      </div>
+                    )}
                   </td>
                   <td style={{ color: 'var(--text-muted)' }}>{k.description || '-'}</td>
                   <td style={{ color: 'var(--text-muted)' }}>{new Date(k.created_at).toLocaleDateString()}</td>

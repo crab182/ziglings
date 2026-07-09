@@ -68,3 +68,9 @@ pointing at it and `MCP_BACKEND_KEY` set to an admin key you created.
   Hub desktop parses JSON first and falls back to markdown.
 - New admin-capable tools must be added to `ADMIN_TOOLS`.
 - Never forward client Authorization to the backend; use `MCP_BACKEND_KEY`.
+- **Per-collection ACLs**: non-admin keys may carry a `collections`
+  allowlist. The backend enforces it in `require_collection_access`;
+  the MCP server must enforce it too (`_COLLECTION_SCOPED_TOOLS` +
+  resource filtering) because it calls the backend with the admin
+  service key. New collection-reading MCP tools must join
+  `_COLLECTION_SCOPED_TOOLS`.

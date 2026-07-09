@@ -163,6 +163,13 @@ def run():
     r = client.get("/api/admin/bootstrap-required")
     check("bootstrap required (fresh)", r.json().get("bootstrap_required") is True)
 
+    # Bootstrap must fail loud on a scoped/non-admin request rather than
+    # silently minting an unrestricted admin key.
+    r = client.post("/api/admin/api-keys", json={"name": "reader", "collections": ["public"]})
+    check("bootstrap rejects scoped key request", r.status_code == 400, f"{r.status_code}: {r.text[:200]}")
+    r = client.post("/api/admin/api-keys", json={"name": "reader", "is_admin": False})
+    check("bootstrap rejects non-admin key request", r.status_code == 400, f"{r.status_code}")
+
     r = client.post("/api/admin/api-keys", json={"name": "admin", "is_admin": True})
     check("create bootstrap key", r.status_code == 200, f"{r.status_code}: {r.text[:300]}")
     key = r.json().get("key") if r.status_code == 200 else None
@@ -321,6 +328,58 @@ def run():
         _re.ENABLE_CONTEXTUAL_INGEST = False
         _re._contextualize_sync = _orig_ctx
         _col.upsert = _orig_upsert
+
+    # Per-collection ACLs: a scoped non-admin key can only touch its collections.
+    r = client.post("/api/documents/collections/acl_allowed", headers=hdr)
+    check("create acl_allowed collection", r.status_code == 200, f"{r.status_code}")
+    r = client.post("/api/admin/api-keys", headers=hdr,
+                    json={"name": "scoped", "collections": ["acl_allowed"]})
+    check("create scoped key", r.status_code == 200, f"{r.status_code}: {r.text[:200]}")
+    scoped_key = r.json().get("key") if r.status_code == 200 else None
+    scoped_hdr = {"Authorization": f"Bearer {scoped_key}"}
+    r = client.post("/api/documents/query", headers=scoped_hdr,
+                    json={"query": "x", "collection": "acl_allowed", "n_results": 3})
+    check("scoped key queries allowed collection", r.status_code == 200, f"{r.status_code}: {r.text[:150]}")
+    r = client.post("/api/documents/query", headers=scoped_hdr,
+                    json={"query": "x", "collection": "default", "n_results": 3})
+    check("scoped key blocked on other collection", r.status_code == 403, f"{r.status_code}: {r.text[:150]}")
+    r = client.get("/api/documents/list?collection=default", headers=scoped_hdr)
+    check("scoped key blocked on list", r.status_code == 403, f"{r.status_code}")
+    r = client.get("/api/documents/collections", headers=scoped_hdr)
+    names = [c["name"] for c in r.json().get("collections", [])] if r.status_code == 200 else []
+    check("collections listing filtered for scoped key",
+          r.status_code == 200 and names and set(names) <= {"acl_allowed"}, f"{r.status_code}: {names}")
+    r = client.get("/api/documents/collections", headers=hdr)
+    admin_names = [c["name"] for c in r.json().get("collections", [])] if r.status_code == 200 else []
+    check("admin sees all collections", "default" in admin_names, str(admin_names)[:150])
+    r = client.post("/api/documents/query", headers=hdr,
+                    json={"query": "x", "collection": "acl_allowed", "n_results": 3})
+    check("admin bypasses ACL", r.status_code == 200, f"{r.status_code}")
+    r = client.post("/api/admin/api-keys", headers=hdr,
+                    json={"name": "badscope", "collections": ["../etc"]})
+    check("invalid ACL collection name rejected", r.status_code == 422, f"{r.status_code}")
+
+    # /admin/status must not leak out-of-scope collection names to scoped keys
+    # (it would bypass the filtered /documents/collections listing).
+    r = client.get("/api/admin/status", headers=scoped_hdr)
+    status_cols = r.json().get("collections", []) if r.status_code == 200 else None
+    check("admin/status filtered for scoped key",
+          r.status_code == 200 and set(status_cols) <= {"acl_allowed"},
+          f"{r.status_code}: {status_cols}")
+    r = client.get("/api/admin/status", headers=hdr)
+    check("admin/status unfiltered for admin",
+          "default" in r.json().get("collections", []), r.text[:150])
+
+    # Prometheus metrics endpoint (admin-gated, text exposition format).
+    r = client.get("/api/admin/metrics/prometheus", headers=hdr)
+    check("prometheus endpoint 200", r.status_code == 200, f"{r.status_code}: {r.text[:150]}")
+    body = r.text if r.status_code == 200 else ""
+    check("prometheus is plain text",
+          r.headers.get("content-type", "").startswith("text/plain"), r.headers.get("content-type"))
+    check("prometheus has query counter", "rag_queries_total" in body, body[:200])
+    check("prometheus has collection gauge", "rag_collection_chunks{" in body, body[:200])
+    check("prometheus requires admin",
+          client.get("/api/admin/metrics/prometheus", headers=scoped_hdr).status_code == 403)
 
     print("\n" + "=" * 50)
     print(f"RESULT: {len(_failures)} failure(s)")
