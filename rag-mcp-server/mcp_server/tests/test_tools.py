@@ -58,6 +58,11 @@ class FakeClient:
 
     def _record(self, verb, path, **kw):
         self.calls.append((verb, path, kw.get("json")))
+        params = kw.get("params")
+        if isinstance(params, dict):
+            response = FakeClient._responses.get((verb, path, tuple(sorted(params.items()))))
+            if response is not None:
+                return response
         return FakeClient._responses.get((verb, path), FakeResponse(404, text="not stubbed"))
 
     async def post(self, path, **kw):
@@ -88,6 +93,38 @@ def _call(name, args, *, is_admin=True, responses=None, collections=None):
         result = asyncio.run(server.handle_tool_call(
             name, args, caller_is_admin=is_admin, caller_collections=collections
         ))
+    finally:
+        server.httpx.AsyncClient = real
+    return result, captured["client"]
+
+
+def _jsonrpc(method, params=None, *, is_admin=True, responses=None, collections=None):
+    """Run an async JSON-RPC method with FakeClient stubbed in for httpx.AsyncClient."""
+    FakeClient._responses = responses or {}
+    captured = {"client": None}
+
+    def _factory(*a, **kw):
+        c = FakeClient(*a, **kw)
+        captured["client"] = c
+        return c
+
+    body = {"jsonrpc": "2.0", "id": 1, "method": method}
+    if params is not None:
+        body["params"] = params
+
+    real = server.httpx.AsyncClient
+    server.httpx.AsyncClient = _factory
+    try:
+        result = server.handle_jsonrpc(body)
+        if result and any(result.get(flag) for flag in (
+            "_async_tool_call",
+            "_async_resource_list",
+            "_async_resource_read",
+            "_async_prompt_get",
+        )):
+            result = asyncio.run(server._handle_async_jsonrpc(
+                result, caller_is_admin=is_admin, caller_collections=collections
+            ))
     finally:
         server.httpx.AsyncClient = real
     return result, captured["client"]
@@ -372,6 +409,73 @@ class CollectionACLTests(unittest.TestCase):
         payload = json.loads(result["content"][1]["text"])
         self.assertEqual(len(payload["collections"]), 3)
         self.assertEqual(payload["total_documents"], 55)
+
+
+class ResourceACLTests(unittest.TestCase):
+    """Per-collection ACLs on MCP resources, which use the backend service key."""
+
+    def _resource_responses(self):
+        return {
+            ("GET", "/api/documents/collections"): FakeResponse(200, {"collections": [
+                {"name": "default", "document_count": 1, "chunk_count": 4},
+                {"name": "manuals", "document_count": 1, "chunk_count": 8},
+            ]}),
+            ("GET", "/api/documents/list", (("collection", "default"),)):
+                FakeResponse(200, {"documents": ["secret.pdf"]}),
+            ("GET", "/api/documents/list", (("collection", "manuals"),)):
+                FakeResponse(200, {"documents": ["router.pdf"]}),
+        }
+
+    def test_resource_list_filtered_for_scoped_key(self):
+        result, client = _jsonrpc(
+            "resources/list",
+            is_admin=False,
+            collections=["manuals"],
+            responses=self._resource_responses(),
+        )
+
+        self.assertEqual(result["jsonrpc"], "2.0")
+        resources = result["result"]["resources"]
+        self.assertEqual([r["uri"] for r in resources], [
+            "rag://collections/manuals/documents/router.pdf",
+        ])
+        self.assertNotIn("secret.pdf", json.dumps(resources))
+        list_calls = [call for call in client.calls if call[1] == "/api/documents/list"]
+        self.assertEqual(len(list_calls), 1)
+
+    def test_resource_read_denied_outside_scope_without_backend_content_call(self):
+        result, client = _jsonrpc(
+            "resources/read",
+            {"uri": "rag://collections/default/documents/secret.pdf"},
+            is_admin=False,
+            collections=["manuals"],
+            responses={("GET", "/api/documents/content"):
+                       FakeResponse(200, {"content": "must not be read"})},
+        )
+
+        self.assertEqual(result["error"]["code"], -32602)
+        self.assertIn("Permission denied", result["error"]["message"])
+        self.assertEqual(client.calls, [])
+
+    def test_resource_read_allowed_in_scope(self):
+        uri = "rag://collections/manuals/documents/router.pdf"
+        result, client = _jsonrpc(
+            "resources/read",
+            {"uri": uri},
+            is_admin=False,
+            collections=["manuals"],
+            responses={("GET", "/api/documents/content", (
+                ("collection", "manuals"), ("source", "router.pdf"),
+            )): FakeResponse(200, {"content": "reset instructions", "chunk_count": 1})},
+        )
+
+        self.assertEqual(result["result"]["contents"], [{
+            "uri": uri,
+            "mimeType": "text/plain",
+            "text": "reset instructions",
+        }])
+        self.assertEqual(client.calls, [("GET", "/api/documents/content", None)])
+        self.assertEqual(client.headers.get("Authorization"), "Bearer test-backend-key")
 
 
 class AskDocumentsTests(unittest.TestCase):
