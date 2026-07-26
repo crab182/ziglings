@@ -93,6 +93,27 @@ def _call(name, args, *, is_admin=True, responses=None, collections=None):
     return result, captured["client"]
 
 
+def _async_jsonrpc(result, *, is_admin=True, responses=None, collections=None):
+    """Run an async JSON-RPC continuation with FakeClient stubbed in."""
+    FakeClient._responses = responses or {}
+    captured = {"client": None}
+
+    def _factory(*a, **kw):
+        c = FakeClient(*a, **kw)
+        captured["client"] = c
+        return c
+
+    real = server.httpx.AsyncClient
+    server.httpx.AsyncClient = _factory
+    try:
+        response = asyncio.run(server._handle_async_jsonrpc(
+            result, caller_is_admin=is_admin, caller_collections=collections
+        ))
+    finally:
+        server.httpx.AsyncClient = real
+    return response, captured["client"]
+
+
 class CreateCollectionTests(unittest.TestCase):
     def test_admin_required(self):
         result, _ = _call("create_collection", {"name": "demo"}, is_admin=False)
@@ -393,6 +414,25 @@ class AskDocumentsTests(unittest.TestCase):
                                is_admin=False, collections=["manuals"])
         self.assertTrue(result["isError"])
         self.assertIsNone(client)  # denied before any backend call
+
+
+class ResourceACLTests(unittest.TestCase):
+    def test_resource_read_denied_outside_scope_without_backend_call(self):
+        result, client = _async_jsonrpc(
+            {
+                "_async_resource_read": True,
+                "id": 1,
+                "params": {"uri": "rag://collections/default/documents/secret.pdf"},
+            },
+            is_admin=False,
+            collections=["manuals"],
+        )
+
+        self.assertEqual(result["jsonrpc"], "2.0")
+        self.assertEqual(result["id"], 1)
+        self.assertEqual(result["error"]["code"], -32602)
+        self.assertIn("cannot access collection 'default'", result["error"]["message"])
+        self.assertEqual(client.calls, [])
 
 
 if __name__ == "__main__":
