@@ -343,8 +343,29 @@ def run():
     r = client.post("/api/documents/query", headers=scoped_hdr,
                     json={"query": "x", "collection": "default", "n_results": 3})
     check("scoped key blocked on other collection", r.status_code == 403, f"{r.status_code}: {r.text[:150]}")
+    check("scoped key denied detail names collection",
+          "not permitted to access collection 'default'" in r.text, r.text[:150])
+    r = client.post("/api/documents/ask", headers=scoped_hdr,
+                    json={"query": "x", "collection": "acl_allowed", "n_results": 3})
+    check("scoped key asks allowed collection", r.status_code == 200, f"{r.status_code}: {r.text[:150]}")
+    r = client.post("/api/documents/ask", headers=scoped_hdr,
+                    json={"query": "x", "collection": "default", "n_results": 3})
+    check("scoped key blocked on ask", r.status_code == 403, f"{r.status_code}: {r.text[:150]}")
+    r = client.post("/api/documents/ask/stream", headers=scoped_hdr,
+                    json={"query": "x", "collection": "acl_allowed", "n_results": 3})
+    check("scoped key streams allowed collection", r.status_code == 200, f"{r.status_code}: {r.text[:150]}")
+    check("scoped key allowed stream is event-stream",
+          "text/event-stream" in r.headers.get("content-type", ""), r.headers.get("content-type"))
+    r = client.post("/api/documents/ask/stream", headers=scoped_hdr,
+                    json={"query": "x", "collection": "default", "n_results": 3})
+    check("scoped key blocked on ask/stream", r.status_code == 403, f"{r.status_code}: {r.text[:150]}")
     r = client.get("/api/documents/list?collection=default", headers=scoped_hdr)
     check("scoped key blocked on list", r.status_code == 403, f"{r.status_code}")
+    r = client.get("/api/documents/content?source=manual1&collection=default", headers=scoped_hdr)
+    check("scoped key blocked on content", r.status_code == 403, f"{r.status_code}: {r.text[:150]}")
+    r = client.get("/api/documents/content?source=manual1&collection=acl_allowed", headers=scoped_hdr)
+    check("scoped key reaches content for allowed collection",
+          r.status_code in (200, 404), f"{r.status_code}: {r.text[:150]}")
     r = client.get("/api/documents/collections", headers=scoped_hdr)
     names = [c["name"] for c in r.json().get("collections", [])] if r.status_code == 200 else []
     check("collections listing filtered for scoped key",
@@ -355,6 +376,12 @@ def run():
     r = client.post("/api/documents/query", headers=hdr,
                     json={"query": "x", "collection": "acl_allowed", "n_results": 3})
     check("admin bypasses ACL", r.status_code == 200, f"{r.status_code}")
+    r = client.post("/api/documents/ask", headers=hdr,
+                    json={"query": "x", "collection": "default", "n_results": 3})
+    check("admin bypasses ACL on ask", r.status_code == 200, f"{r.status_code}: {r.text[:150]}")
+    r = client.get("/api/documents/content?source=manual1&collection=default", headers=hdr)
+    check("admin bypasses ACL on content",
+          r.status_code in (200, 404), f"{r.status_code}: {r.text[:150]}")
     r = client.post("/api/admin/api-keys", headers=hdr,
                     json={"name": "badscope", "collections": ["../etc"]})
     check("invalid ACL collection name rejected", r.status_code == 422, f"{r.status_code}")
