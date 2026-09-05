@@ -49,6 +49,7 @@ class FakeClient:
         self.base_url = base_url
         self.headers = headers or {}
         self.calls = []  # (verb, path, json_body)
+        self.requests = []  # full request metadata for tests that assert params
 
     async def __aenter__(self):
         return self
@@ -58,6 +59,12 @@ class FakeClient:
 
     def _record(self, verb, path, **kw):
         self.calls.append((verb, path, kw.get("json")))
+        self.requests.append({
+            "verb": verb,
+            "path": path,
+            "json": kw.get("json"),
+            "params": kw.get("params"),
+        })
         return FakeClient._responses.get((verb, path), FakeResponse(404, text="not stubbed"))
 
     async def post(self, path, **kw):
@@ -91,6 +98,27 @@ def _call(name, args, *, is_admin=True, responses=None, collections=None):
     finally:
         server.httpx.AsyncClient = real
     return result, captured["client"]
+
+
+def _jsonrpc_async(result, *, is_admin=True, responses=None, collections=None):
+    """Run _handle_async_jsonrpc with FakeClient stubbed in for httpx.AsyncClient."""
+    FakeClient._responses = responses or {}
+    captured = {"client": None}
+
+    def _factory(*a, **kw):
+        c = FakeClient(*a, **kw)
+        captured["client"] = c
+        return c
+
+    real = server.httpx.AsyncClient
+    server.httpx.AsyncClient = _factory
+    try:
+        response = asyncio.run(server._handle_async_jsonrpc(
+            result, is_admin, caller_collections=collections
+        ))
+    finally:
+        server.httpx.AsyncClient = real
+    return response, captured["client"]
 
 
 class CreateCollectionTests(unittest.TestCase):
@@ -372,6 +400,50 @@ class CollectionACLTests(unittest.TestCase):
         payload = json.loads(result["content"][1]["text"])
         self.assertEqual(len(payload["collections"]), 3)
         self.assertEqual(payload["total_documents"], 55)
+
+
+class ResourceACLTests(unittest.TestCase):
+    """Per-collection ACLs on MCP Resources, which bypass handle_tool_call."""
+
+    def test_resource_list_filters_and_only_fetches_allowed_collections(self):
+        response, client = _jsonrpc_async(
+            {"_async_resource_list": True, "id": 7},
+            is_admin=False,
+            collections=["manuals"],
+            responses={
+                ("GET", "/api/documents/collections"): FakeResponse(200, {"collections": [
+                    {"name": "default", "document_count": 3, "chunk_count": 40},
+                    {"name": "manuals", "document_count": 1, "chunk_count": 12},
+                    {"name": "hr_confidential", "document_count": 4, "chunk_count": 80},
+                ]}),
+                ("GET", "/api/documents/list"): FakeResponse(200, {"documents": ["router.pdf"]}),
+            },
+        )
+
+        resources = response["result"]["resources"]
+        self.assertEqual(resources, [{
+            "uri": "rag://collections/manuals/documents/router.pdf",
+            "name": "router.pdf",
+            "description": "Document in collection 'manuals'",
+            "mimeType": "text/plain",
+        }])
+        list_requests = [r for r in client.requests if r["path"] == "/api/documents/list"]
+        self.assertEqual([r["params"] for r in list_requests], [{"collection": "manuals"}])
+
+    def test_resource_read_denied_outside_scope_without_backend_request(self):
+        response, client = _jsonrpc_async(
+            {
+                "_async_resource_read": True,
+                "id": 8,
+                "params": {"uri": "rag://collections/default/documents/router.pdf"},
+            },
+            is_admin=False,
+            collections=["manuals"],
+        )
+
+        self.assertEqual(response["error"]["code"], -32602)
+        self.assertIn("cannot access collection 'default'", response["error"]["message"])
+        self.assertEqual(client.requests, [])
 
 
 class AskDocumentsTests(unittest.TestCase):
