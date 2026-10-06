@@ -1,6 +1,6 @@
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
-chromadb==0.5.23
+chromadb==1.5.9
 sentence-transformers==3.3.1
 python-multipart>=0.0.30
 pydantic==2.10.4
